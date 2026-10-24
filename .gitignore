@@ -2,3 +2,12 @@
 __pycache__/
 *.py[cod]
 .DS_Store
+runs/
+.pytest_cache/
+
+# large or local-only files
+*.pt
+*.mp4
+!sample_data/*.mp4
+_orig_phase1/
+nearmiss/

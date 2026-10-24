@@ -1,5 +1,9 @@
-ultralytics>=8.2.0
-opencv-python-headless>=4.9.0
-streamlit>=1.35.0
-pandas>=2.2.0
-numpy>=1.26.0
+ultralytics
+lapx
+opencv-python-headless
+streamlit
+streamlit-image-coordinates
+imageio-ffmpeg
+pandas
+numpy
+pytest

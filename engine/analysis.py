@@ -1,0 +1,220 @@
+"""Glue between the tracker's CSV and the conflict engine, plus the pictures the app shows.
+
+Everything here works on files, so it is easy to test without Streamlit.
+"""
+from __future__ import annotations
+
+import csv
+import html
+import json
+import subprocess
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import cv2
+import numpy as np
+
+from .calibration import Calibration
+from .config import Settings, KIND_LABEL
+from .conflicts import detect_conflicts
+from .privacy import blur_detections
+from .trajectories import Detections, Track, build_tracks
+
+# The tracker writes COCO names; the engine wants "pedestrian".
+CLASS_ALIASES = {"person": "pedestrian"}
+
+SEV_COLOR = {"candidate": (0, 200, 255), "moderate": (0, 140, 255), "serious": (60, 60, 235)}  # BGR
+GROUP_COLOR = {"ped": (90, 200, 90), "bike": (180, 80, 160), "veh": (200, 130, 70)}   # BGR: green, purple, blue
+
+
+# ------------------------------------------------------------------ loading
+def load_tracker_csv(path) -> Detections:
+    """Read the CSV written by the Detect page (frame,time_s,track_id,class_name,confidence,x1..y2,...)."""
+    rows = []
+    with open(path, newline="") as f:
+        for r in csv.DictReader(f):
+            cls = CLASS_ALIASES.get(r["class_name"], r["class_name"])
+            rows.append((int(r["frame"]), float(r["time_s"]), int(r["track_id"]), cls, float(r["confidence"]),
+                         float(r["x1"]), float(r["y1"]), float(r["x2"]), float(r["y2"])))
+    return Detections(rows)
+
+
+def analyze(det: Detections, calib: Calibration, S: Settings,
+            motion: Optional[Dict[int, np.ndarray]] = None) -> Tuple[List[Track], Dict, List[Dict]]:
+    tracks, stats = build_tracks(det, calib, S, motion)
+    events = detect_conflicts(tracks, S, stats)
+    stats["analysed_tracks"] = len(tracks)
+    return tracks, stats, events
+
+
+# ------------------------------------------------------------------ boxes at a time
+def boxes_near(det: Detections, t: float, max_dt: float = 0.5) -> List[Tuple[int, str, np.ndarray]]:
+    """For every track, its observed box nearest in time to t (within max_dt)."""
+    out = []
+    for tid in det.track_ids():
+        idx = det.rows_of(tid)
+        j = idx[np.argmin(np.abs(det.t[idx] - t))]
+        if abs(det.t[j] - t) <= max_dt:
+            out.append((tid, str(det.cls[j]), det.box[j]))
+    return out
+
+
+def event_frame(video_path: str, det: Detections, ev: Dict, privacy_level: str = "standard",
+                blur: bool = True) -> np.ndarray:
+    """Full-resolution frame at the moment of closest approach: road users blurred, the two involved ones outlined."""
+    from video_utils import grab_frame
+
+    img = grab_frame(video_path, ev["t_peak"])
+    near = boxes_near(det, ev["t_peak"])
+    if blur:
+        img = blur_detections(img, [(c, b) for _, c, b in near], privacy_level)
+    col = SEV_COLOR.get(ev["severity"], (0, 200, 255))
+    centers = []
+    for tid, c, b in near:
+        if tid in (ev["a"]["track"], ev["b"]["track"]):
+            x1, y1, x2, y2 = [int(v) for v in b]
+            cv2.rectangle(img, (x1, y1), (x2, y2), col, 3)
+            centers.append(((x1 + x2) // 2, y2))
+    if len(centers) == 2:
+        cv2.line(img, centers[0], centers[1], col, 2, cv2.LINE_AA)
+    label = f"{ev['id']}  {ev['kind_label']}  closest {ev['d_min_m']} m"
+    if ev.get("ttc_min_s") is not None:
+        label += f"  TTC {ev['ttc_min_s']} s"
+    cv2.rectangle(img, (0, 0), (img.shape[1], 34), (0, 0, 0), -1)
+    cv2.putText(img, label, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+    return img
+
+
+def cut_clip(src_video: str, out_path: str, t0: float, t1: float) -> bool:
+    """Cut [t0, t1] out of a video as browser-playable H.264. Returns False if ffmpeg is missing or fails."""
+    from video_utils import ffmpeg_exe
+
+    exe = ffmpeg_exe()
+    if not exe:
+        return False
+    t0 = max(0.0, t0)
+    cmd = [exe, "-y", "-loglevel", "error", "-ss", f"{t0:.3f}", "-i", src_video, "-t", f"{max(0.5, t1 - t0):.3f}",
+           "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "24", "-pix_fmt", "yuv420p",
+           "-movflags", "+faststart", out_path]
+    try:
+        return subprocess.run(cmd, timeout=120).returncode == 0 and Path(out_path).exists()
+    except Exception:
+        return False
+
+
+# ------------------------------------------------------------------ top-down map
+def topdown_map(tracks: Sequence[Track], events: Sequence[Dict], calib: Calibration,
+                size: int = 900, heat: bool = True, show_tracks: bool = True) -> np.ndarray:
+    """Bird's-eye picture: trajectories, a heat layer of events, event markers, a metre scale bar."""
+    pts = [t.xy for t in tracks if len(t.xy)]
+    pts += [np.array([[e["x"], e["y"]] for e in events])] if events else []
+    corners, _ = calib.img_to_map(calib.image_points)
+    pts.append(np.asarray(corners))
+    allp = np.vstack(pts)
+    lo, hi = np.percentile(allp, 1, axis=0) - 3.0, np.percentile(allp, 99, axis=0) + 3.0
+    span = np.maximum(hi - lo, 1.0)
+    s = (size - 40) / float(max(span))
+    w, h = int(span[0] * s) + 40, int(span[1] * s) + 40
+
+    def px(p):
+        p = np.atleast_2d(p)
+        return np.c_[20 + (p[:, 0] - lo[0]) * s, h - 20 - (p[:, 1] - lo[1]) * s]
+
+    img = np.full((h, w, 3), 245, np.uint8)
+    cv2.polylines(img, [px(corners).astype(np.int32)], True, (170, 170, 170), 2, cv2.LINE_AA)
+    if show_tracks:
+        for t in tracks:
+            if len(t.xy) < 2:
+                continue
+            cv2.polylines(img, [px(t.xy).astype(np.int32)], False, GROUP_COLOR.get(t.group, (150, 150, 150)), 1,
+                          cv2.LINE_AA)
+    if heat and events:
+        acc = np.zeros((h, w), np.float32)
+        for e in events:
+            x, y = px([e["x"], e["y"]])[0]
+            cv2.circle(acc, (int(x), int(y)), 1, float(1 + e["severity_level"]), -1)
+        acc = cv2.GaussianBlur(acc, (0, 0), max(8.0, 1.5 * s))
+        if acc.max() > 0:
+            hm = cv2.applyColorMap((255 * acc / acc.max()).astype(np.uint8), cv2.COLORMAP_INFERNO)
+            a = (acc / acc.max() * 0.75)[..., None]
+            img = (img * (1 - a) + hm * a).astype(np.uint8)
+    for e in events:
+        x, y = px([e["x"], e["y"]])[0]
+        cv2.circle(img, (int(x), int(y)), 7, SEV_COLOR.get(e["severity"], (0, 200, 255)), -1, cv2.LINE_AA)
+        cv2.circle(img, (int(x), int(y)), 7, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(img, e["id"], (int(x) + 9, int(y) - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (30, 30, 30), 1,
+                    cv2.LINE_AA)
+    bar_m = 5 if span[0] < 60 else 10
+    x0, y0 = 24, h - 8
+    cv2.line(img, (x0, y0), (int(x0 + bar_m * s), y0), (40, 40, 40), 3)
+    cv2.putText(img, f"{bar_m} m", (x0, y0 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (40, 40, 40), 1, cv2.LINE_AA)
+    return img
+
+
+def distance_series(tracks: Sequence[Track], ev: Dict, pad_s: float = 1.5) -> Dict[str, List[float]]:
+    """Distance between the two road users of an event over time (for the chart on the review page)."""
+    by = {(t.id, t.seg): t for t in tracks}
+    A, B = by.get((ev["a"]["track"], ev["a"]["seg"])), by.get((ev["b"]["track"], ev["b"]["seg"]))
+    if A is None or B is None:
+        return {"t": [], "distance_m": []}
+    t0, t1 = ev["t_start"] - pad_s, ev["t_end"] + pad_s
+    ts, ds = [], []
+    for k, tt in enumerate(A.t):
+        if tt < t0 or tt > t1:
+            continue
+        j = np.where(np.isclose(B.t, tt, atol=1e-6))[0]
+        if len(j):
+            ts.append(round(float(tt), 2))
+            ds.append(round(float(np.linalg.norm(A.xy[k] - B.xy[j[0]])), 2))
+    return {"t": ts, "distance_m": ds}
+
+
+# ------------------------------------------------------------------ report
+def events_table(events: Sequence[Dict]) -> List[Dict]:
+    rows = []
+    for e in events:
+        rows.append({
+            "id": e["id"], "time_s": e["t_peak"], "type": e["kind_label"], "severity": e["severity"],
+            "closest_m": e["d_min_m"], "ttc_min_s": e["ttc_min_s"], "pet_s": e["pet_s"],
+            "below_3ft": e.get("below_3ft"), "why": "; ".join(e.get("reasons", [])),
+            "label": e.get("label") or "",
+        })
+    return rows
+
+
+def build_report_html(title: str, meta: Dict, calib_info: Dict, S: Settings, events: Sequence[Dict],
+                      validation: Dict, ai_disclosure: str, map_png_b64: str,
+                      frames_b64: Optional[Dict[str, str]] = None) -> str:
+    """One self-contained HTML page (print it to PDF from the browser)."""
+    esc = html.escape
+    frames_b64 = frames_b64 or {}
+    rows = ""
+    for r in events_table(events):
+        rows += "<tr>" + "".join(f"<td>{esc(str(r[k]))}</td>" for k in
+                                 ["id", "time_s", "type", "severity", "closest_m", "ttc_min_s", "pet_s", "label"]) + "</tr>"
+    cards = ""
+    for e in events:
+        img = frames_b64.get(e["id"])
+        cards += (f"<div class='card'><b>{esc(e['id'])}</b> {esc(e['kind_label'])}, {esc(e['severity'])}, "
+                  f"t = {e['t_peak']} s<br>closest {e['d_min_m']} m, TTC {e['ttc_min_s']} s<br>"
+                  f"<small>{esc('; '.join(e.get('reasons', [])))}</small>"
+                  + (f"<br><img src='data:image/jpeg;base64,{img}'>" if img else "") + "</div>")
+    v = json.dumps(validation, indent=1)
+    return f"""<!doctype html><html><head><meta charset='utf-8'><title>{esc(title)}</title>
+<style>body{{font:15px/1.5 system-ui,sans-serif;max-width:900px;margin:24px auto;padding:0 16px;color:#222}}
+table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ccc;padding:4px 8px;text-align:left}}
+.card{{border:1px solid #ccc;border-radius:8px;padding:10px;margin:10px 0;break-inside:avoid}}
+img{{max-width:100%;border-radius:6px}}pre{{background:#f4f4f4;padding:10px;overflow:auto}}</style></head><body>
+<h1>{esc(title)}</h1>
+<p><b>Screening report, not a safety certification.</b> Flags show where road users came close or crossed paths in
+this one recording. They do not predict crashes. Footage is a single fixed camera; distances are only as good as the
+calibration below.</p>
+<h2>Recording</h2><pre>{esc(json.dumps(meta, indent=1))}</pre>
+<h2>Calibration</h2><pre>{esc(json.dumps(calib_info, indent=1))}</pre>
+<h2>Thresholds used</h2><pre>{esc(json.dumps(S.to_dict(), indent=1))}</pre>
+<h2>Top-down map</h2><img src='data:image/png;base64,{map_png_b64}'>
+<h2>Events ({len(events)})</h2><table><tr><th>ID</th><th>t (s)</th><th>Type</th><th>Severity</th><th>Closest (m)</th>
+<th>Min TTC (s)</th><th>PET (s)</th><th>My label</th></tr>{rows}</table>{cards}
+<h2>Validation (my own review of the flags)</h2><pre>{esc(v)}</pre>
+<h2>AI use disclosure</h2><p>{esc(ai_disclosure).replace(chr(10), '<br>')}</p>
+</body></html>"""

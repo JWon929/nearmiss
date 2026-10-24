@@ -1,0 +1,194 @@
+{
+  "video": "sample_data/synthetic_intersection.mp4",
+  "fps": 30.0,
+  "size": [
+    960,
+    540
+  ],
+  "H_ground_to_image": [
+    [
+      780.0,
+      465.16664348301225,
+      15612.684070357102
+    ],
+    [
+      0.0,
+      30.482511107030724,
+      12291.323756093927
+    ],
+    [
+      0.0,
+      0.9690971739229421,
+      32.526425146577296
+    ]
+  ],
+  "calibration_points_px": [
+    [
+      429.35010697273725,
+      214.3821510297483
+    ],
+    [
+      530.6498930272628,
+      214.3821510297483
+    ],
+    [
+      553.9031828144034,
+      298.36393989983304
+    ],
+    [
+      406.09681718559654,
+      298.36393989983304
+    ]
+  ],
+  "calibration_width_m": 8.0,
+  "calibration_length_m": 20.0,
+  "actors": [
+    {
+      "name": "carA",
+      "cls": "car",
+      "waypoints": [
+        [
+          10.0,
+          2.0,
+          0.0
+        ],
+        [
+          16.0,
+          2.0,
+          60.0
+        ]
+      ]
+    },
+    {
+      "name": "ped1",
+      "cls": "pedestrian",
+      "waypoints": [
+        [
+          5.29,
+          -6.0,
+          20.0
+        ],
+        [
+          15.29,
+          8.0,
+          20.0
+        ]
+      ]
+    },
+    {
+      "name": "carB",
+      "cls": "car",
+      "waypoints": [
+        [
+          31.0,
+          -2.0,
+          60.0
+        ],
+        [
+          38.5,
+          -2.0,
+          0.0
+        ]
+      ]
+    },
+    {
+      "name": "ped2",
+      "cls": "pedestrian",
+      "waypoints": [
+        [
+          31.86,
+          8.0,
+          20.0
+        ],
+        [
+          43.29,
+          -8.0,
+          20.0
+        ]
+      ]
+    },
+    {
+      "name": "bike1",
+      "cls": "bicycle",
+      "waypoints": [
+        [
+          26.0,
+          3.5,
+          0.0
+        ],
+        [
+          38.0,
+          3.5,
+          60.0
+        ]
+      ]
+    },
+    {
+      "name": "carC",
+      "cls": "car",
+      "waypoints": [
+        [
+          28.33,
+          2.1,
+          0.0
+        ],
+        [
+          33.33,
+          2.1,
+          60.0
+        ]
+      ]
+    },
+    {
+      "name": "bike2",
+      "cls": "bicycle",
+      "waypoints": [
+        [
+          44.0,
+          3.5,
+          0.0
+        ],
+        [
+          56.0,
+          3.5,
+          60.0
+        ]
+      ]
+    },
+    {
+      "name": "carD",
+      "cls": "car",
+      "waypoints": [
+        [
+          46.33,
+          0.7,
+          0.0
+        ],
+        [
+          51.33,
+          0.7,
+          60.0
+        ]
+      ]
+    }
+  ],
+  "expected_events": [
+    {
+      "name": "carA-ped1",
+      "kind": "ped-veh",
+      "t_peak_approx": 12.0,
+      "min_severity": "serious"
+    },
+    {
+      "name": "carC-bike1",
+      "kind": "bike-veh",
+      "t_peak_approx": 30.0,
+      "min_severity": "moderate",
+      "below_3ft": true
+    }
+  ],
+  "expected_no_event": [
+    "carB-ped2",
+    "carD-bike2"
+  ]
+}
