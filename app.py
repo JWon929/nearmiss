@@ -30,8 +30,11 @@ from engine import demo
 from engine import validation
 from engine.analysis import (analyze, build_report_html, cut_clip, distance_series, event_frame, events_table,
                              load_tracker_csv, topdown_map)
+from engine import review_pack
 from engine.calibration import Calibration, CalibrationError
-from engine.config import KIND_LABEL, Settings
+from engine.config import KIND_LABEL, SEVERITY_LEVELS, Settings
+from engine.insights import (MPS_TO_MPH, explain_event, sensitivity, speed_summary, tuning_curve,
+                             vehicle_size_check)
 from engine.motion import load_motion
 from engine.roi import as_polygon as roi_polygon
 from video_utils import AnnotatedVideoWriter, grab_frame, read_metadata
@@ -88,6 +91,16 @@ def current():
 
 def source_path(rid: str) -> str:
     return str(run_dir(rid) / "source.mp4")
+
+
+def has_source(rid: str) -> bool:
+    """False once the user deleted the original (unblurred) video to protect privacy."""
+    return (run_dir(rid) / "source.mp4").exists()
+
+
+def recording_info(rid: str) -> dict:
+    """The recording metadata sheet (date, place, weather...) filled in on the Report page."""
+    return read_json(run_dir(rid) / "recording_info.json", {})
 
 
 def load_calibration(rid: str):
@@ -209,8 +222,12 @@ with st.sidebar:
         st.session_state["rec_pick"] = st.session_state["rid"]
         st.selectbox("Recording", ids, key="rec_pick", format_func=lambda i: dict(runs)[i], on_change=pick_recording)
     done = steps_done(st.session_state.get("rid"))
+    # The option labels must not change between runs: Streamlit treats a radio whose labels changed as a new widget
+    # and resets it to the first page (labelling the first event used to jump back to Detect). So the ticks go below.
     page = st.radio("Steps", PAGES, key="page",
-                    format_func=lambda p: ("✓ " if done.get(p) else "") + (f"{PAGES.index(p) + 1}. {p}" if p != "Method" else p))
+                    format_func=lambda p: f"{PAGES.index(p) + 1}. {p}" if p != "Method" else p)
+    if any(done.values()):
+        st.caption("Done: " + ", ".join(f"✓ {p}" for p in PAGES if done.get(p)))
     st.divider()
     if demo.demo_available() and st.button("Load synthetic demo"):
         st.session_state["rid"] = create_demo_run()
@@ -235,12 +252,33 @@ def blind_spot(m: dict):
             "not a safe result.")
 
 
+def settings_banner() -> str:
+    """One line tying every page's numbers to the settings that produced them."""
+    S = load_settings(rid)
+    model = meta.get("model_used") or meta.get("settings", {}).get("model_name") or ("scripted" if meta.get("synthetic") else "?")
+    view = {"center": "straight down", "bottom": "angled"}[S.ground_point]
+    _, cd = load_calibration(rid)
+    if cd is None:
+        cal = "not calibrated"
+    else:
+        inp = cd.get("input", {})
+        cal = (f"{inp['distance_m']} m line" if inp.get("method") == "line"
+               else f"{cd['width_m']:g} x {cd['length_m']:g} m rectangle")
+        checks = cd.get("checks") or []
+        cal += f", check error {checks[0]['error_pct']:+.1f}%" if checks else ", no accuracy check"
+    return (f"Settings: model **{model}** · camera {view} · calibration {cal} · TTC candidate/moderate/serious "
+            f"{S.ttc_candidate_s:g}/{S.ttc_moderate_s:g}/{S.ttc_serious_s:g} s · road area "
+            f"{'on' if load_roi(rid) else 'off'} · blur {S.privacy_level}"
+            + ("" if has_source(rid) else " · original video deleted"))
+
+
 def need_run() -> bool:
     if rid is None:
         st.info("Start on the **Detect** page: upload a clip. Or click *Load synthetic demo* in the sidebar to try the "
                 "whole app without footage.")
         return True
     st.caption(f"Recording: **{dict(list_runs()).get(rid, rid)}**  (change it in the sidebar)")
+    st.caption(settings_banner())
     if meta.get("synthetic"):
         st.warning("Synthetic demo: scripted road users on a drawn road. It checks the maths on a known answer. "
                    "It says nothing about accuracy on real traffic.")
@@ -340,9 +378,18 @@ def page_detect():
     rows = []
     t0 = time.time()
     n = 0
+
+    def progress(i: int, tot: int) -> None:
+        done = min(i / max(tot, 1), 1.0)
+        took = time.time() - t0
+        text = f"Frame {i}/{tot}"
+        if done > 0.02 and took > 3:            # the first frames include model warm-up, so wait before estimating
+            left = took * (1 - done) / done
+            text += f" · about {left / 60:.0f} min left" if left >= 90 else f" · about {left:.0f} s left"
+        prog.progress(done, text=text)
+
     try:
-        for res in tracker.process_video(str(src), m["fps"],
-                                         lambda i, tot: prog.progress(min(i / max(tot, 1), 1.0), text=f"Frame {i}/{tot}")):
+        for res in tracker.process_video(str(src), m["fps"], progress):
             writer.write(res.annotated)
             for x in res.detections:
                 rows.append([x.frame, f"{x.time_s:.4f}", x.track_id, x.class_name, f"{x.confidence:.3f}",
@@ -441,6 +488,10 @@ def show_calibration_hints(method: str, pts: list, w_m: float, l_m: float, size)
 def page_calibrate():
     st.header("2. Calibrate (turn pixels into metres)")
     if need_run():
+        return
+    if not has_source(rid):
+        st.info("The original video of this recording was deleted for privacy, so the calibration cannot be redone. "
+                "The saved calibration is still used for the analysis.")
         return
     S = load_settings(rid)
     _, saved = load_calibration(rid)
@@ -597,6 +648,13 @@ def page_calibrate():
     st.subheader("Check it")
     for h in cal.quality_hints(check_shape=d.get("input", {}).get("method", "rect") == "rect"):
         st.warning(h)
+    if a is not None:
+        size = vehicle_size_check(a[2], cal, a[1], load_motion(read_json(run_dir(rid) / "motion.json")))
+        if size and size["warning"]:
+            st.warning(size["warning"])
+        elif size:
+            st.caption(f"Sanity check: cars measure {size['median_car_length_m']} m long on average with this "
+                       f"calibration ({size['cars_sampled']} boxes), in line with real cars (about 4-5 m).")
     a, b = st.columns(2)
     a.image(rgb(cal.preview(frame)), caption="Bird's-eye view of the road. Straight lines should look straight and "
             "lane edges parallel.", width="stretch")
@@ -706,7 +764,70 @@ def page_results():
                       args=("Event Review",), kwargs={f"ev_{rid}": pick})
         else:
             st.success("No events flagged with these thresholds. Try loosening them, or check the calibration.")
+    speed_ui(S, tracks)
+    sensitivity_ui(S, tracks)
     export_ui(S, stats, tracks, events)
+
+
+def speed_ui(S: Settings, tracks) -> None:
+    with st.expander("Vehicle speeds"):
+        info = recording_info(rid)
+        limit = st.number_input("Posted speed limit (mph, optional)", 0, 80, int(info.get("posted_limit_mph", 0)), 5,
+                                help="Leave at 0 if you do not know it.")
+        if limit != info.get("posted_limit_mph", 0):
+            info["posted_limit_mph"] = limit
+            write_json(run_dir(rid) / "recording_info.json", info)
+        sp = speed_summary(tracks, S, limit / MPS_TO_MPH if limit else None)
+        if not sp["vehicles"]:
+            st.caption("No moving vehicle was tracked long enough to measure its speed.")
+            return
+        mph = lambda v: f"{v * MPS_TO_MPH:.0f} mph"
+        c = st.columns(4)
+        c[0].metric("Vehicles measured", sp["vehicles"])
+        c[1].metric("Median speed", mph(sp["median_mps"]))
+        c[2].metric("85th percentile", mph(sp["p85_mps"]),
+                    help="The speed 85% of drivers stay under: the usual summary of a spot-speed study.")
+        if limit:
+            c[3].metric("Over the limit", f"{sp['share_over_limit']:.0%}",
+                        help=f"{sp['share_over_limit_by_5mph']:.0%} were more than 5 mph over.")
+        else:
+            c[3].metric("Fastest", mph(sp["max_mps"]))
+        counts, edges = np.histogram(np.array(sp["speeds_mps"]) * MPS_TO_MPH, bins=np.arange(0, 85, 5))
+        keep = slice(0, int(np.flatnonzero(counts).max()) + 2)          # stop just past the fastest bin
+        st.bar_chart(pd.DataFrame({"vehicles": counts[keep]}, index=edges[:-1][keep].astype(int)),
+                     height=180, x_label="speed (mph, 5 mph bins: 25 means 25-30)", y_label="vehicles")
+        st.caption("Each vehicle's speed is the 85th percentile of its own moving samples, so a brief tracking spike "
+                   "does not count. Speeds are only as accurate as the calibration (a 5% scale error is a 5% speed error).")
+
+
+@st.cache_data(show_spinner="Re-running the conflict check at other thresholds...")
+def cached_sensitivity(rid: str, csv_mtime: float, cal_json: str, settings_json: str, motion_mtime: float,
+                       roi_json: str):
+    _, tracks, _, _ = cached_analysis(rid, csv_mtime, cal_json, settings_json, motion_mtime, roi_json)
+    return sensitivity(tracks, Settings.from_dict(json.loads(settings_json)))
+
+
+def sensitivity_ui(S: Settings, tracks) -> None:
+    with st.expander("Sensitivity: how the count depends on the thresholds"):
+        st.caption("The thresholds are tunable starting points, not magic numbers. This re-runs the check with one "
+                   "threshold changed at a time, so you can see how much the event count depends on it.")
+        if not st.toggle("Run it", key=f"sens_{rid}"):
+            return
+        _, d = load_calibration(rid)
+        core = {k: d[k] for k in ("image_points", "width_m", "length_m", "H", "rot", "frame_size")}
+        res = cached_sensitivity(rid, mtime(run_dir(rid) / "detections.csv"), json.dumps(core),
+                                 json.dumps(S.to_dict()), mtime(run_dir(rid) / "motion.json"), json.dumps(load_roi(rid)))
+        a, b = st.columns(2)
+        with a:
+            st.write("**Candidate TTC threshold**")
+            df = pd.DataFrame(res["ttc"]).rename(columns={"ttc_candidate_s": "TTC under (s)"})
+            df["current"] = df["current"].map({True: "◀ now", False: ""})
+            st.dataframe(df, hide_index=True, width="stretch")
+        with b:
+            st.write("**Distance thresholds, scaled**")
+            df = pd.DataFrame(res["proximity"]).rename(columns={"proximity_scale": "x current distances"})
+            df["current"] = df["current"].map({True: "◀ now", False: ""})
+            st.dataframe(df, hide_index=True, width="stretch")
 
 
 def tracks_csv(tracks) -> str:
@@ -725,7 +846,9 @@ def export_ui(S: Settings, stats: dict, tracks, events) -> None:
         _, cd = load_calibration(rid)
         bundle = {"recording": {k: v for k, v in meta.items()}, "calibration": cd, "road_area": load_roi(rid),
                   "settings": S.to_dict(), "stats": stats, "events": events,
-                  "labels": read_json(run_dir(rid) / "labels.json", {})}
+                  "labels": read_json(run_dir(rid) / "labels.json", {}), "recording_info": recording_info(rid),
+                  "speeds": speed_summary(tracks, S), "other_reviewers": [
+                      read_json(p, {}) for p in sorted(run_dir(rid).glob("review_*.json"))]}
         a, b, c = st.columns(3)
         a.download_button("run.json (everything)", json.dumps(bundle, indent=1, default=str),
                           f"nearmiss_{rid}.json", "application/json")
@@ -773,11 +896,25 @@ def step_event(key: str, delta: int, n: int) -> None:
 
 
 def label_event(ev: dict, lab: str, key: str, go_to: int) -> None:
-    """Button callback: save the label, then move on (go_to = next event's index)."""
+    """Button callback: save the label (with the note typed for this event), then move on (go_to = next index)."""
     store = read_json(run_dir(rid) / "labels.json", {})
-    validation.set_label(store, ev["kind"], ev["t_peak"], lab)
+    validation.set_label(store, ev["kind"], ev["t_peak"], lab, st.session_state.get(f"note_{rid}_{ev['id']}", ""))
     write_json(run_dir(rid) / "labels.json", store)
     st.session_state[key] = go_to
+
+
+def review_filters(events: list) -> list:
+    """Narrow the review list by type, severity and review status."""
+    with st.expander("Filter events"):
+        a, b, c = st.columns(3)
+        kinds = a.multiselect("Type", sorted({e["kind"] for e in events}), format_func=KIND_LABEL.get,
+                              key=f"f_kind_{rid}")
+        sevs = b.multiselect("Severity", [s for s in SEVERITY_LEVELS if any(e["severity"] == s for e in events)],
+                             key=f"f_sev_{rid}")
+        status = c.selectbox("Status", ["all", "not reviewed", "real", "false alarm", "unsure"], key=f"f_stat_{rid}")
+        want = {"not reviewed": None, "real": "tp", "false alarm": "fp", "unsure": "unsure"}
+        return [e for e in events if (not kinds or e["kind"] in kinds) and (not sevs or e["severity"] in sevs)
+                and (status == "all" or e.get("label") == want[status])]
 
 
 def event_name(e: dict) -> str:
@@ -794,6 +931,11 @@ def page_review():
         st.info("Nothing to review yet. Detect, calibrate, and check Results.")
         return
     cal, S, det, tracks, stats, events = a
+    all_events = events
+    events = review_filters(events)
+    if not events:
+        st.info("No events match the filter.")
+        return
     key = f"ev_{rid}"
     if st.session_state.get(key, 0) >= len(events):
         st.session_state[key] = 0
@@ -804,8 +946,9 @@ def page_review():
     idx = n3.selectbox("Event", range(len(events)), key=key, format_func=lambda i: event_name(events[i]),
                        label_visibility="collapsed")
     ev = events[idx]
-    reviewed = sum(1 for e in events if e.get("label"))
-    st.progress(reviewed / len(events), text=f"Reviewed {reviewed} of {len(events)}")
+    reviewed = sum(1 for e in all_events if e.get("label"))
+    st.progress(reviewed / len(all_events), text=f"Reviewed {reviewed} of {len(all_events)}"
+                + ("" if len(events) == len(all_events) else f" · showing {len(events)} that match the filter"))
     if hasattr(st, "iframe"):                      # Streamlit >= 1.5x; components.html is deprecated there
         st.iframe(REVIEW_KEYS_JS, height=1)
     else:
@@ -815,9 +958,12 @@ def page_review():
 
     c1, c2 = st.columns([3, 2])
     with c1:
-        blur = not st.toggle("Show unblurred (this computer only)", False)
-        st.image(rgb(event_frame(source_path(rid), det, ev, S.privacy_level, blur)), width="stretch",
-                 caption="The moment of closest approach. The two road users are outlined.")
+        if has_source(rid):
+            blur = not st.toggle("Show unblurred (this computer only)", False)
+            st.image(rgb(event_frame(source_path(rid), det, ev, S.privacy_level, blur)), width="stretch",
+                     caption="The moment of closest approach. The two road users are outlined.")
+        else:
+            st.caption("The original video was deleted for privacy, so only the blurred clip is shown.")
         t0, t1 = ev["t_start"] - S.clip_before_s, ev["t_end"] + S.clip_after_s
         clip = run_dir(rid) / f"clip_{max(t0, 0):.2f}_{t1:.2f}.mp4"     # by time: event IDs change with thresholds
         ann = run_dir(rid) / "annotated.mp4"
@@ -834,8 +980,7 @@ def page_review():
                     help="Time to collision: seconds until they would touch if both kept going straight at the same speed.")
         m[2].metric("PET", f"{ev['pet_s']} s" if ev["pet_s"] is not None else "n/a",
                     help="Post-encroachment time: gap between the first leaving and the second reaching the crossing point.")
-        st.write(f"**{ev['kind_label']}** at t = {ev['t_peak']} s. Speeds: {ev['a']['cls']} {ev['a']['speed_mps']} m/s, "
-                 f"{ev['b']['cls']} {ev['b']['speed_mps']} m/s.")
+        st.write(f"**{ev['kind_label']}.** {explain_event(ev)}")
         if ev.get("below_3ft"):
             st.warning("Estimated clearance is under 3 ft (0.91 m), the California passing rule for bikes.")
         st.caption("Why it was flagged: " + "; ".join(ev["reasons"]))
@@ -843,10 +988,17 @@ def page_review():
         if ds["t"]:
             st.line_chart(pd.DataFrame({"distance between them (m)": ds["distance_m"]}, index=ds["t"]), height=180)
         st.write("**Was this a real near miss?** Watch the clip, then choose.")
+        note_key = f"note_{rid}_{ev['id']}"
+        if note_key not in st.session_state:
+            st.session_state[note_key] = ev.get("label_note", "")
+        st.text_input("Note (optional, saved with your label)", key=note_key,
+                      placeholder="e.g. car stopped late at the crosswalk")
         b = st.columns(3)
+        # with the "not reviewed" filter a labelled event leaves the list, so the next one moves up to this index
+        nxt = idx if st.session_state.get(f"f_stat_{rid}") == "not reviewed" else min(idx + 1, len(events) - 1)
         for col, lab in zip(b, ["tp", "fp", "unsure"]):
             col.button(LABEL_TEXT[lab], key=f"{lab}_{ev['id']}", type="primary" if ev.get("label") == lab else "secondary",
-                       width="stretch", on_click=label_event, args=(ev, lab, key, idx + 1 if idx < len(events) - 1 else idx))
+                       width="stretch", on_click=label_event, args=(ev, lab, key, nxt))
         if ev.get("label"):
             st.button("Remove my label", key=f"clear_{ev['id']}", on_click=label_event, args=(ev, "clear", key, idx))
     with st.expander("Add a near miss the app missed"):
@@ -917,22 +1069,160 @@ def page_report():
         st.warning(blind_spot(meta))
     with st.expander("All numbers"):
         st.json(summ)
+    tuning_ui(S, events)
+    second_review_ui(det, S, events, store)
+    metadata_ui()
+    privacy_ui()
     _, cd = load_calibration(rid)
     disclosure = st.text_area("AI-use disclosure (the Congressional App Challenge requires it)", AI_TEXT, height=200)
     if st.button("Build report", type="primary"):
-        frames = {e["id"]: jpg_b64(event_frame(source_path(rid), det, e, S.privacy_level, True)) for e in events[:30]}
+        frames = event_frames(det, S, events[:30])
         page = build_report_html(meta.get("name", rid), {k: v for k, v in meta.items() if k != "settings"},
                                  {k: cd[k] for k in ("width_m", "length_m", "input", "checks") if k in cd}, S, events, summ,
                                  disclosure, png_b64(topdown_map(tracks, events, cal)), frames,
                                  notes=[n.replace("**", "") for n in [blind_spot(meta)] if n],
                                  exposure={k: stats[k] for k in ("road_users", "pairs_together", "events_per_100_vehicles",
                                                                  "events_per_1000_pairs",
-                                                                 "events_per_1000_pairs_by_kind", "events_per_hour")})
+                                                                 "events_per_1000_pairs_by_kind", "events_per_hour")},
+                                 info=recording_info(rid), explain=explain_event,
+                                 speeds=speed_summary(tracks, S, (recording_info(rid).get("posted_limit_mph") or 0)
+                                                      / MPS_TO_MPH or None))
         st.session_state[f"report_{rid}"] = page
     if f"report_{rid}" in st.session_state:
         st.download_button("Download report.html (print to PDF)", st.session_state[f"report_{rid}"],
                            "nearmiss_report.html", "text/html")
         st.download_button("Download events.json", json.dumps(events, indent=1, default=str), "events.json")
+
+
+def event_frames(det, S: Settings, events) -> dict:
+    """Blurred closest-moment frames as base64 JPEGs; none once the original video has been deleted."""
+    if not has_source(rid):
+        return {}
+    return {e["id"]: jpg_b64(event_frame(source_path(rid), det, e, S.privacy_level, True)) for e in events}
+
+
+def tuning_ui(S: Settings, events) -> None:
+    with st.expander("Threshold tuning from your labels"):
+        t = tuning_curve(events, S)
+        st.caption(t["caveat"])
+        if not t["labelled"]:
+            st.info("Label some events as real or false alarm on Event Review first.")
+            return
+        if not t["enough"]:
+            st.info(f"{t['labelled']} labelled events ({t['real']} real) so far. At least 10, with 3 or more real, are "
+                    "needed before a suggestion means anything. The tables below are shown for interest.")
+        else:
+            parts = []
+            if t["suggest_ttc"] is not None:
+                parts.append(f"flagging by TTC only under **{t['suggest_ttc']} s**")
+            if t["suggest_scale"] is not None:
+                parts.append(f"distance thresholds at **{t['suggest_scale']:g} x** the current ones")
+            if parts:
+                st.success("On your labelled events, the best precision that still keeps at least 80% of the real near "
+                           "misses comes from " + " and ".join(parts) + ". Re-check it on a different clip before "
+                           "trusting it.")
+            else:
+                st.info("No stricter cutoff keeps 80% of your real near misses, so the current thresholds stay.")
+        a, b = st.columns(2)
+        a.write("**TTC cutoff**")
+        a.dataframe(pd.DataFrame(t["ttc"]), hide_index=True, width="stretch")
+        b.write("**Distance cutoff (x current)**")
+        b.dataframe(pd.DataFrame(t["distance"]), hide_index=True, width="stretch")
+
+
+def second_review_ui(det, S: Settings, events, store: dict) -> None:
+    with st.expander("Second reviewer (review pack and agreement)"):
+        st.caption("Export a single HTML page someone else can open in any browser to label the events, without "
+                   "installing anything. Your own labels are left out so their review is independent. They send back "
+                   "a small JSON file; load it here to see how often you agree.")
+        if st.button("Build review pack"):
+            with st.spinner("Rendering blurred frames..."):
+                frames = event_frames(det, S, events)
+                st.session_state[f"pack_{rid}"] = review_pack.build_pack_html(
+                    meta.get("name", rid), events, frames, explain_event, f"{rid}-{uuid.uuid4().hex[:6]}")
+        if f"pack_{rid}" in st.session_state:
+            st.download_button("Download review_pack.html", st.session_state[f"pack_{rid}"],
+                               f"nearmiss_review_pack_{rid}.html", "text/html")
+            st.caption("The pack contains blurred frames only. Check them before sending it to anyone.")
+        up = st.file_uploader("Load a reviewer's answers (.json)", type=["json"], key=f"rev_up_{rid}")
+        if up is None:
+            return
+        try:
+            theirs = review_pack.read_pack_answers(up.getvalue())
+        except ValueError as e:
+            st.error(str(e))
+            return
+        ag = review_pack.agreement(events, store.get("events", []), theirs["events"])
+        who = theirs["reviewer"] or "the other reviewer"
+        if not ag["both_labelled"]:
+            st.info(f"No event was labelled by both you and {who} yet.")
+            return
+        c = st.columns(3)
+        c[0].metric("Labelled by both", ag["both_labelled"])
+        c[1].metric("Agreement", f"{ag['agree']:.0%}")
+        c[2].metric("Cohen's kappa", ag["kappa"], help="Agreement corrected for chance: 1 is perfect, 0 is no better "
+                                                       "than guessing. " + review_pack.kappa_words(ag["kappa"]) + ".")
+        st.caption(f"Kappa {ag['kappa']} is usually described as *{review_pack.kappa_words(ag['kappa'])}* agreement "
+                   "(Landis and Koch).")
+        st.write("Rows: your label · columns: " + who)
+        names = {l: review_pack.LABEL_TEXT[l] for l in review_pack.LABELS}
+        st.dataframe(pd.DataFrame(ag["table"]).T.rename(index=names, columns=names), width="stretch")
+        if ag["disagreements"]:
+            st.write("**Where you disagree** (worth watching again together)")
+            st.dataframe(pd.DataFrame(ag["disagreements"]).replace(names), hide_index=True, width="stretch")
+        if st.button("Save these answers with this recording"):
+            write_json(run_dir(rid) / f"review_{uuid.uuid4().hex[:6]}.json", theirs)
+            st.success("Saved. They are included in run.json exports.")
+
+
+INFO_FIELDS = [("date", "Date recorded"), ("time", "Time of day"), ("location", "Location / intersection"),
+               ("weather", "Weather"), ("lighting", "Lighting"), ("camera", "Camera (phone, action cam, drone model)"),
+               ("camera_height_m", "Camera height or drone altitude (m)"), ("notes", "Anything unusual")]
+
+
+def metadata_ui() -> None:
+    with st.expander("Recording details (date, place, weather, camera)"):
+        st.caption("Saved with the recording and printed in the report, so old results stay interpretable.")
+        info = recording_info(rid)
+        with st.form(f"info_{rid}"):
+            vals = {}
+            cols = st.columns(2)
+            for i, (k, label) in enumerate(INFO_FIELDS):
+                if k == "lighting":
+                    opts = ["", "daylight", "overcast", "dusk / dawn", "night, street lights", "night, dark"]
+                    vals[k] = cols[i % 2].selectbox(label, opts, index=opts.index(info.get(k, "")) if info.get(k, "") in opts else 0)
+                else:
+                    vals[k] = cols[i % 2].text_input(label, info.get(k, ""))
+            if st.form_submit_button("Save details"):
+                info.update(vals)
+                write_json(run_dir(rid) / "recording_info.json", info)
+                st.success("Saved.")
+
+
+def privacy_ui() -> None:
+    with st.expander("Privacy: files stored for this recording"):
+        st.caption("Everything below is on this computer only. The original video is the only file with unblurred "
+                   "faces and plates.")
+        rows = []
+        for p in sorted(run_dir(rid).iterdir()):
+            what = {"source.mp4": "original video (NOT blurred)", "annotated.mp4": "annotated video (blurred)",
+                    "detections.csv": "boxes per frame (no images)", "labels.json": "your labels",
+                    "calibration.json": "calibration", "roi.json": "road area", "settings.json": "thresholds",
+                    "motion.json": "camera motion", "meta.json": "recording facts",
+                    "recording_info.json": "recording details"}.get(p.name)
+            if what is None:
+                what = "event clip (blurred)" if p.name.startswith("clip_") else (
+                    "second reviewer's answers" if p.name.startswith("review_") else "other")
+            rows.append({"file": p.name, "contains": what, "size (MB)": round(p.stat().st_size / 1e6, 2)})
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        if has_source(rid):
+            st.write("**Delete the original video.** The analysis, labels, blurred video and report keep working. "
+                     "You can no longer redo detection or calibration, see unblurred frames, or put frames in a report "
+                     "or review pack.")
+            ok = st.checkbox("I understand this cannot be undone", key=f"del_src_ok_{rid}")
+            if st.button("Delete original video", disabled=not ok):
+                (run_dir(rid) / "source.mp4").unlink(missing_ok=True)
+                st.rerun()
 
 
 # ================================================================== METHOD

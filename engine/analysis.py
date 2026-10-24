@@ -224,10 +224,22 @@ def events_table(events: Sequence[Dict]) -> List[Dict]:
 def build_report_html(title: str, meta: Dict, calib_info: Dict, S: Settings, events: Sequence[Dict],
                       validation: Dict, ai_disclosure: str, map_png_b64: str,
                       frames_b64: Optional[Dict[str, str]] = None, notes: Sequence[str] = (),
-                      exposure: Optional[Dict] = None) -> str:
-    """One self-contained HTML page (print it to PDF from the browser). `notes` are blind spots to state up front."""
+                      exposure: Optional[Dict] = None, info: Optional[Dict] = None, explain=None,
+                      speeds: Optional[Dict] = None) -> str:
+    """One self-contained HTML page (print it to PDF from the browser). `notes` are blind spots to state up front,
+    `info` the recording details sheet, `explain` turns an event into a plain-language sentence."""
     esc = html.escape
     frames_b64 = frames_b64 or {}
+    info_rows = "".join(f"<tr><th>{esc(k.replace('_', ' '))}</th><td>{esc(str(v))}</td></tr>"
+                        for k, v in (info or {}).items() if v not in ("", None, 0))
+    info_html = f"<h2>Recording details</h2><table>{info_rows}</table>" if info_rows else ""
+    speed_html = ""
+    if speeds and speeds.get("vehicles"):
+        mph = lambda v: f"{v * 2.23694:.0f} mph"
+        speed_html = (f"<h2>Vehicle speeds</h2><p>{speeds['vehicles']} vehicles measured. Median {mph(speeds['median_mps'])}, "
+                      f"85th percentile {mph(speeds['p85_mps'])}, fastest {mph(speeds['max_mps'])}."
+                      + (f" {speeds['share_over_limit']:.0%} over the posted limit of {mph(speeds['limit_mps'])}."
+                         if speeds.get("limit_mps") else "") + "</p>")
     notes_html = "".join(f"<p class='warn'><b>Limitation:</b> {esc(n)}</p>" for n in notes)
     kind_rows = "".join(
         f"<tr><td>{esc(KIND_LABEL.get(k, k))}</td><td>{v['flagged']}</td><td>{v['tp']}</td><td>{v['fp']}</td>"
@@ -249,7 +261,8 @@ def build_report_html(title: str, meta: Dict, calib_info: Dict, S: Settings, eve
         img = frames_b64.get(e["id"])
         cards += (f"<div class='card'><b>{esc(e['id'])}</b> {esc(e['kind_label'])}, {esc(e['severity'])}, "
                   f"t = {e['t_peak']} s<br>closest {e['d_min_m']} m, TTC {e['ttc_min_s']} s<br>"
-                  f"<small>{esc('; '.join(e.get('reasons', [])))}</small>"
+                  + (f"{esc(explain(e))}<br>" if explain else "")
+                  + f"<small>{esc('; '.join(e.get('reasons', [])))}</small>"
                   + (f"<br><img src='data:image/jpeg;base64,{img}'>" if img else "") + "</div>")
     v = json.dumps(validation, indent=1)
     return f"""<!doctype html><html><head><meta charset='utf-8'><title>{esc(title)}</title>
@@ -262,7 +275,7 @@ img{{max-width:100%;border-radius:6px}}pre{{background:#f4f4f4;padding:10px;over
 <p><b>Screening report, not a safety certification.</b> Flags show where road users came close or crossed paths in
 this one recording. They do not predict crashes. Footage is a single fixed camera; distances are only as good as the
 calibration below.</p>{notes_html}
-<h2>Recording</h2><pre>{esc(json.dumps(meta, indent=1))}</pre>{exposure_html}
+{info_html}<h2>Recording</h2><pre>{esc(json.dumps(meta, indent=1))}</pre>{exposure_html}{speed_html}
 <h2>Calibration</h2><pre>{esc(json.dumps(calib_info, indent=1))}</pre>
 <h2>Thresholds used</h2><pre>{esc(json.dumps(S.to_dict(), indent=1))}</pre>
 <h2>Top-down map</h2><img src='data:image/png;base64,{map_png_b64}'>

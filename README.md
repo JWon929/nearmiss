@@ -52,8 +52,28 @@ Road users outside it (parked cars in a lot, people on the sidewalk) are ignored
 Raw event counts grow with traffic. Results also shows events per 100 vehicles, per 1,000 road-user pairs that were
 on the road at the same time (overall and per conflict type), and per hour.
 
+## Extra measurements (Results and Report pages)
+- **Vehicle speeds:** median and 85th-percentile speed, and the share over an optional posted limit.
+- **Sensitivity:** event counts re-computed at other TTC and distance thresholds, so the effect of each setting is visible.
+- **Threshold tuning from your labels:** precision at stricter cutoffs and a suggested setting once at least
+  10 events are labelled. It describes your clips only, not a general standard.
+- **Car-size check (drone footage):** if cars measure far from 4-5 m long, the calibration scale is probably off.
+- Every event has a plain-language sentence, e.g. *"A car (9.3 m/s, 21 mph) and a pedestrian came within 1.4 m..."*
+
+## Second reviewer
+Report -> *Second reviewer* builds `review_pack.html`: one file with blurred frames and label buttons that anyone can
+open in a browser. Your own labels are left out. Load the JSON they send back to see percent agreement and Cohen's
+kappa, plus the events you disagree on.
+
+## Privacy
+Report -> *Privacy* lists every file stored for a recording. *Delete original video* removes the only unblurred file;
+the analysis, labels, blurred video and report keep working.
+
 ## Reviewing and exporting
 - Event Review keys: **T** real near miss, **F** false alarm, **U** unsure, **←/→** previous/next.
+  Filter by type, severity and review status; add a note to any label.
+- Every page shows a settings line (model, calibration and its check error, thresholds, road area), and Report has a
+  recording-details sheet (date, place, weather, lighting, camera) that is printed in the report.
 - The Report page shows precision per conflict type and how many events are still unreviewed.
 - Results -> *Export this run*: `run.json` (recording, calibration, road area, settings, stats, events, labels),
   `tracks.csv` (every trajectory sample in metres), and `labels.json`, which can be imported back.
