@@ -40,11 +40,50 @@ def load_tracker_csv(path) -> Detections:
 
 
 def analyze(det: Detections, calib: Calibration, S: Settings,
-            motion: Optional[Dict[int, np.ndarray]] = None) -> Tuple[List[Track], Dict, List[Dict]]:
-    tracks, stats = build_tracks(det, calib, S, motion)
+            motion: Optional[Dict[int, np.ndarray]] = None,
+            roi: Optional[np.ndarray] = None) -> Tuple[List[Track], Dict, List[Dict]]:
+    tracks, stats = build_tracks(det, calib, S, motion, roi)
     events = detect_conflicts(tracks, S, stats)
     stats["analysed_tracks"] = len(tracks)
+    stats.update(exposure(tracks, events, 1.0 / S.analysis_hz))
     return tracks, stats, events
+
+
+def exposure(tracks: Sequence[Track], events: Sequence[Dict], dt: float) -> Dict:
+    """How much traffic there was to have conflicts with, so busy and quiet clips can be compared.
+
+    Raw event counts grow with traffic: twice the cars, about twice the events, with no change in risk.
+    So events are also given per 100 vehicles and per 1,000 road-user pairs that were on the road at the
+    same time (only the pair kinds the engine checks: ped-veh, bike-veh, veh-veh)."""
+    from .conflicts import pair_kind
+
+    ids = {}
+    for t in tracks:                      # one road user can be split into segments; count it once
+        ids.setdefault(t.group, set()).add(t.id)
+    counts = {g: len(s) for g, s in ids.items()}
+    pairs = {"ped-veh": 0, "bike-veh": 0, "veh-veh": 0}
+    seen = set()
+    for i, A in enumerate(tracks):
+        for B in tracks[i + 1:]:
+            kind = pair_kind(A.group, B.group)
+            key = tuple(sorted((A.id, B.id)))
+            if kind is None or A.id == B.id or key in seen:
+                continue
+            if min(A.k1, B.k1) - max(A.k0, B.k0) >= 2:     # on the road together for a few samples
+                seen.add(key)
+                pairs[kind] += 1
+    n_pairs, n_veh = sum(pairs.values()), counts.get("veh", 0)
+    hours = (max((t.k1 for t in tracks), default=0) - min((t.k0 for t in tracks), default=0)) * dt / 3600.0
+    by_kind = {k: sum(1 for e in events if e["kind"] == k) for k in pairs}
+    return {
+        "road_users": counts,
+        "pairs_together": pairs,
+        "events_per_100_vehicles": round(100.0 * len(events) / n_veh, 2) if n_veh else None,
+        "events_per_1000_pairs": round(1000.0 * len(events) / n_pairs, 2) if n_pairs else None,
+        "events_per_1000_pairs_by_kind": {k: round(1000.0 * by_kind[k] / pairs[k], 2) if pairs[k] else None
+                                          for k in pairs},
+        "events_per_hour": round(len(events) / hours, 1) if hours > 0 else None,
+    }
 
 
 # ------------------------------------------------------------------ boxes at a time
@@ -184,10 +223,23 @@ def events_table(events: Sequence[Dict]) -> List[Dict]:
 
 def build_report_html(title: str, meta: Dict, calib_info: Dict, S: Settings, events: Sequence[Dict],
                       validation: Dict, ai_disclosure: str, map_png_b64: str,
-                      frames_b64: Optional[Dict[str, str]] = None) -> str:
-    """One self-contained HTML page (print it to PDF from the browser)."""
+                      frames_b64: Optional[Dict[str, str]] = None, notes: Sequence[str] = (),
+                      exposure: Optional[Dict] = None) -> str:
+    """One self-contained HTML page (print it to PDF from the browser). `notes` are blind spots to state up front."""
     esc = html.escape
     frames_b64 = frames_b64 or {}
+    notes_html = "".join(f"<p class='warn'><b>Limitation:</b> {esc(n)}</p>" for n in notes)
+    kind_rows = "".join(
+        f"<tr><td>{esc(KIND_LABEL.get(k, k))}</td><td>{v['flagged']}</td><td>{v['tp']}</td><td>{v['fp']}</td>"
+        f"<td>{v['unsure']}</td><td>{v['unreviewed']}</td>"
+        f"<td>{'n/a' if v['precision'] is None else format(v['precision'], '.0%')}</td></tr>"
+        for k, v in validation.get("by_kind", {}).items())
+    kind_table = ("<table><tr><th>Type</th><th>Flagged</th><th>Real</th><th>False alarms</th><th>Unsure</th>"
+                  f"<th>Not reviewed</th><th>Precision</th></tr>{kind_rows}</table>") if kind_rows else ""
+    unreviewed = (f"<p class='warn'>{validation['unreviewed']} of {validation['events_flagged']} flagged events were not "
+                  "reviewed; precision covers reviewed events only.</p>") if validation.get("unreviewed") else ""
+    exposure_html = (f"<h2>Traffic exposure</h2><p>Event counts grow with traffic, so rates are given to compare "
+                     f"clips.</p><pre>{esc(json.dumps(exposure, indent=1))}</pre>") if exposure else ""
     rows = ""
     for r in events_table(events):
         rows += "<tr>" + "".join(f"<td>{esc(str(r[k]))}</td>" for k in
@@ -204,17 +256,18 @@ def build_report_html(title: str, meta: Dict, calib_info: Dict, S: Settings, eve
 <style>body{{font:15px/1.5 system-ui,sans-serif;max-width:900px;margin:24px auto;padding:0 16px;color:#222}}
 table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ccc;padding:4px 8px;text-align:left}}
 .card{{border:1px solid #ccc;border-radius:8px;padding:10px;margin:10px 0;break-inside:avoid}}
-img{{max-width:100%;border-radius:6px}}pre{{background:#f4f4f4;padding:10px;overflow:auto}}</style></head><body>
+img{{max-width:100%;border-radius:6px}}pre{{background:#f4f4f4;padding:10px;overflow:auto}}
+.warn{{background:#fff4e0;border-left:4px solid #e08a00;padding:8px 12px}}</style></head><body>
 <h1>{esc(title)}</h1>
 <p><b>Screening report, not a safety certification.</b> Flags show where road users came close or crossed paths in
 this one recording. They do not predict crashes. Footage is a single fixed camera; distances are only as good as the
-calibration below.</p>
-<h2>Recording</h2><pre>{esc(json.dumps(meta, indent=1))}</pre>
+calibration below.</p>{notes_html}
+<h2>Recording</h2><pre>{esc(json.dumps(meta, indent=1))}</pre>{exposure_html}
 <h2>Calibration</h2><pre>{esc(json.dumps(calib_info, indent=1))}</pre>
 <h2>Thresholds used</h2><pre>{esc(json.dumps(S.to_dict(), indent=1))}</pre>
 <h2>Top-down map</h2><img src='data:image/png;base64,{map_png_b64}'>
 <h2>Events ({len(events)})</h2><table><tr><th>ID</th><th>t (s)</th><th>Type</th><th>Severity</th><th>Closest (m)</th>
 <th>Min TTC (s)</th><th>PET (s)</th><th>My label</th></tr>{rows}</table>{cards}
-<h2>Validation (my own review of the flags)</h2><pre>{esc(v)}</pre>
+<h2>Validation (my own review of the flags)</h2>{unreviewed}{kind_table}<pre>{esc(v)}</pre>
 <h2>AI use disclosure</h2><p>{esc(ai_disclosure).replace(chr(10), '<br>')}</p>
 </body></html>"""

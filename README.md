@@ -38,14 +38,36 @@ The stock aerial model misses some moving cars and finds no pedestrians or bikes
    `python tools/compare_models.py your_clip.mp4 compare_out yolo11n-obb.pt nearmiss-visdrone.pt`
 VisDrone: Zhu et al., "Detection and Tracking Meet Drones Challenge", IEEE TPAMI 2021 (hand-labelled drone images).
 
+- Aerial models find vehicles only, so the app warns that pedestrian and bicycle conflicts were **not measured**
+  (zero is a blind spot, not a safe result), and privacy blur covers each whole road user.
+
 ## False-alarm filters
 One road user detected twice, TTC flags shorter than 0.5 s, and a car driving past a stopped one without braking
 are not flagged. The Results page shows how many flags each filter removed.
 
+**Road area (optional).** On **Calibrate**, choose *Road area outline* and click around the roadway and crosswalks.
+Road users outside it (parked cars in a lot, people on the sidewalk) are ignored.
+
+## Comparing clips fairly
+Raw event counts grow with traffic. Results also shows events per 100 vehicles, per 1,000 road-user pairs that were
+on the road at the same time (overall and per conflict type), and per hour.
+
+## Reviewing and exporting
+- Event Review keys: **T** real near miss, **F** false alarm, **U** unsure, **←/→** previous/next.
+- The Report page shows precision per conflict type and how many events are still unreviewed.
+- Results -> *Export this run*: `run.json` (recording, calibration, road area, settings, stats, events, labels),
+  `tracks.csv` (every trajectory sample in metres), and `labels.json`, which can be imported back.
+
 ## Tests
 `python -m pytest tests` checks the maths against a scripted scene with a known answer. That proves the
 calculations, **not** accuracy on real traffic. Measure that yourself on Event Review (real / false alarm / missed).
+GitHub Actions runs the tests on every push (`.github/workflows/tests.yml`).
 
 ## Disclosure (Congressional App Challenge)
-Detection uses pretrained YOLOv8 (Ultralytics, COCO) and ByteTrack. Write down which parts you wrote yourself and
-where AI helped; the Report page has a template.
+Detection uses pretrained models I did not train:
+- **Street-level video:** YOLOv8 (Ultralytics, COCO classes: person, bicycle, motorcycle, car, bus, truck).
+- **Drone video:** YOLO11-OBB (Ultralytics, trained on the DOTA aerial dataset). Vehicles only.
+- **Optional:** `nearmiss-visdrone.pt`, fine-tuned on VisDrone with `tools/train_visdrone_colab.ipynb`.
+- **Tracking:** ByteTrack.
+
+Write down which parts you wrote yourself and where AI helped; the Report page has a template.

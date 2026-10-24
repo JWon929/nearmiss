@@ -61,23 +61,32 @@ def summarize(events: List[Dict], store: Dict) -> Dict:
     n = len(events)
     tp = fp = unsure = 0
     by_sev: Dict[str, Dict[str, int]] = {}
+    by_kind: Dict[str, Dict] = {}
     matched = set()
     for e in events:
         lab = find_label(labels, e["kind"], e["t_peak"])
         s = by_sev.setdefault(e["severity"], {"tp": 0, "fp": 0, "unsure": 0, "unreviewed": 0})
+        k = by_kind.setdefault(e["kind"], {"flagged": 0, "tp": 0, "fp": 0, "unsure": 0, "unreviewed": 0})
+        k["flagged"] += 1
         if lab is None:
             s["unreviewed"] += 1
+            k["unreviewed"] += 1
             continue
         matched.add(id(lab))
         if lab["label"] == "tp":
             tp += 1
             s["tp"] += 1
+            k["tp"] += 1
         elif lab["label"] == "fp":
             fp += 1
             s["fp"] += 1
+            k["fp"] += 1
         else:
             unsure += 1
             s["unsure"] += 1
+            k["unsure"] += 1
+    for k in by_kind.values():
+        k["precision"] = round(k["tp"] / (k["tp"] + k["fp"]), 3) if k["tp"] + k["fp"] else None
     reviewed = tp + fp
     precision = tp / reviewed if reviewed else None
     recall_ub = tp / (tp + len(missed)) if (tp + len(missed)) else None
@@ -92,6 +101,7 @@ def summarize(events: List[Dict], store: Dict) -> Dict:
         "precision": None if precision is None else round(precision, 3),
         "recall_upper_bound": None if recall_ub is None else round(recall_ub, 3),
         "by_severity": by_sev,
+        "by_kind": by_kind,
         "orphaned_labels": sum(1 for lab in labels if id(lab) not in matched),
         "caveat": "Precision is over reviewed events only. Recall is an upper bound: it counts only misses you noticed.",
     }

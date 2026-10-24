@@ -181,9 +181,12 @@ class Calibration:
         a, b = to_img(g0[0]), to_img(g0[0] + np.array([1.0, 0.0]))
         return float(np.linalg.norm(b - a))
 
-    def quality_hints(self) -> List[str]:
-        """Plain-language warnings about calibration quality."""
+    def quality_hints(self, check_shape: bool = True) -> List[str]:
+        """Plain-language warnings about calibration quality. `check_shape` adds the clicked-quadrilateral
+        checks (skip it for a two-point calibration, whose square is built, not clicked)."""
         hints: List[str] = []
+        if check_shape:
+            hints += self._shape_hints()
         fw, fh = self.frame_size
         area = abs(_signed_area(self.image_points))
         frac = area / float(fw * fh)
@@ -201,6 +204,32 @@ class Calibration:
         ratio = max(self.width_m, self.length_m) / min(self.width_m, self.length_m)
         if ratio > 12:
             hints.append("The rectangle is very long and thin; a squarer one is better conditioned.")
+        return hints
+
+    def _shape_hints(self, min_side_px: float = 40.0, min_angle_deg: float = 30.0,
+                     max_foreshortening: float = 4.0) -> List[str]:
+        """Clicked corners that are close together, nearly in a line, or squeezed toward the horizon make a
+        small click error turn into a large distance error."""
+        p = self.image_points
+        sides = np.linalg.norm(np.roll(p, -1, axis=0) - p, axis=1)
+        hints: List[str] = []
+        if sides.min() < min_side_px:
+            hints.append("Two corners are only %.0f pixels apart. A one-pixel click error is then a large distance "
+                         "error: use a bigger shape." % sides.min())
+        angles = []
+        for i in range(4):
+            a, b = p[i - 1] - p[i], p[(i + 1) % 4] - p[i]
+            cosang = np.dot(a, b) / max(np.linalg.norm(a) * np.linalg.norm(b), 1e-9)
+            angles.append(math.degrees(math.acos(float(np.clip(cosang, -1.0, 1.0)))))
+        if min(angles) < min_angle_deg:
+            hints.append("One corner angle is only %.0f degrees: three of the points are nearly in a line. Check the "
+                         "corners were clicked in order around the edge." % min(angles))
+        ratio = max(sides[0] / max(sides[2], 1e-9), sides[2] / max(sides[0], 1e-9),
+                    sides[1] / max(sides[3], 1e-9), sides[3] / max(sides[1], 1e-9))
+        if ratio > max_foreshortening:
+            hints.append("One side looks %.1f times shorter than the side opposite it, so the far edge is close to "
+                         "the horizon. Distances there are very sensitive to click errors: pick a shape nearer the "
+                         "camera." % ratio)
         return hints
 
     # ------------------------------------------------------------- top-down

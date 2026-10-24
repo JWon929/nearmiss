@@ -25,6 +25,7 @@ import numpy as np
 from .calibration import Calibration
 from .config import CLASS_GROUP, Settings
 from .motion import to_reference
+from .roi import inside as roi_inside
 
 CSV_HEADER = ["frame", "t", "track_id", "cls", "conf", "x1", "y1", "x2", "y2"]
 
@@ -186,13 +187,15 @@ def ground_pixels(boxes: np.ndarray, mode: str = "bottom") -> np.ndarray:
 
 
 def build_tracks(det: Detections, calib: Calibration, S: Settings,
-                 motion: Optional[Dict[int, np.ndarray]] = None) -> Tuple[List[Track], Dict]:
-    """`motion` (frame -> homography onto the first frame) undoes camera movement before calibrating."""
+                 motion: Optional[Dict[int, np.ndarray]] = None,
+                 roi: Optional[np.ndarray] = None) -> Tuple[List[Track], Dict]:
+    """`motion` (frame -> homography onto the first frame) undoes camera movement before calibrating.
+    `roi` (polygon in reference-frame pixels, see engine/roi.py) drops ground points outside the road area."""
     dt = 1.0 / S.analysis_hz
     half = max(1, int(round(S.smooth_window_s / dt / 2.0)))
     riders = find_rider_tracks(det)
     stats = {"raw_tracks": len(det.track_ids()), "dropped_riders": len(riders), "dropped_short": 0,
-             "dropped_out_of_range": 0}
+             "dropped_out_of_range": 0, "dropped_outside_roi": 0}
     tracks: List[Track] = []
     center = calib.center_map
     for tid in det.track_ids():
@@ -204,7 +207,12 @@ def build_tracks(det: Detections, calib: Calibration, S: Settings,
         cls = det.track_class(tid)
         boxes = det.box[idx]
         foot = to_reference(ground_pixels(boxes, S.ground_point), det.frame[idx], motion)
+        on_road = roi_inside(foot, roi)
+        if not on_road.any():
+            stats["dropped_outside_roi"] += 1
+            continue
         mp, valid = calib.img_to_map(foot)
+        valid &= on_road
         rng = np.linalg.norm(mp - center, axis=1)
         valid = valid & np.isfinite(rng) & (rng <= S.max_range_m)
         if valid.sum() < S.min_hits:

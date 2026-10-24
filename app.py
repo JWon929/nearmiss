@@ -22,6 +22,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 from detector_tracker import (MODEL_CHOICES, RenderOptions, RoadUserTracker, TrackerSettings, aerial_choices,
                               auto_stride, finds_people, pick_device)
@@ -30,8 +31,9 @@ from engine import validation
 from engine.analysis import (analyze, build_report_html, cut_clip, distance_series, event_frame, events_table,
                              load_tracker_csv, topdown_map)
 from engine.calibration import Calibration, CalibrationError
-from engine.config import Settings
+from engine.config import KIND_LABEL, Settings
 from engine.motion import load_motion
+from engine.roi import as_polygon as roi_polygon
 from video_utils import AnnotatedVideoWriter, grab_frame, read_metadata
 
 RUNS = Path(__file__).parent / "runs"
@@ -101,12 +103,18 @@ def mtime(path: Path) -> float:
     return path.stat().st_mtime if path.exists() else 0.0
 
 
+def load_roi(rid: str) -> list:
+    return read_json(run_dir(rid) / "roi.json", {}).get("points", [])
+
+
 @st.cache_data(show_spinner="Analysing tracks...")
-def cached_analysis(rid: str, csv_mtime: float, cal_json: str, settings_json: str, motion_mtime: float):
+def cached_analysis(rid: str, csv_mtime: float, cal_json: str, settings_json: str, motion_mtime: float,
+                    roi_json: str = "[]"):
     det = load_tracker_csv(run_dir(rid) / "detections.csv")
     cal = Calibration.from_dict(json.loads(cal_json))
     S = Settings.from_dict(json.loads(settings_json))
-    tracks, stats, events = analyze(det, cal, S, load_motion(read_json(run_dir(rid) / "motion.json")))
+    tracks, stats, events = analyze(det, cal, S, load_motion(read_json(run_dir(rid) / "motion.json")),
+                                    roi_polygon(json.loads(roi_json)))
     return det, tracks, stats, events
 
 
@@ -117,7 +125,8 @@ def get_analysis(rid: str):
     S = load_settings(rid)
     core = {k: d[k] for k in ("image_points", "width_m", "length_m", "H", "rot", "frame_size")}  # not the checks
     det, tracks, stats, events = cached_analysis(rid, mtime(run_dir(rid) / "detections.csv"), json.dumps(core),
-                                                 json.dumps(S.to_dict()), mtime(run_dir(rid) / "motion.json"))
+                                                 json.dumps(S.to_dict()), mtime(run_dir(rid) / "motion.json"),
+                                                 json.dumps(load_roi(rid)))
     events = [dict(e) for e in events]
     validation.apply_labels(events, read_json(run_dir(rid) / "labels.json", {}))
     return cal, S, det, tracks, stats, events
@@ -217,6 +226,15 @@ with st.sidebar:
 rid, meta = current()
 
 
+def blind_spot(m: dict):
+    """Warning text when the model cannot see pedestrians or bikes, so '0 ped/bike conflicts' means 'not looked for'."""
+    if not m or m.get("synthetic") or finds_people(m.get("model_used") or m.get("settings", {}).get("model_name", "")):
+        return None
+    return ("**Vehicles only.** The aerial model used for this recording cannot detect pedestrians or bicycles, so "
+            "vehicle-pedestrian and vehicle-bicycle conflicts were **not measured**. Zero of them is a blind spot, "
+            "not a safe result.")
+
+
 def need_run() -> bool:
     if rid is None:
         st.info("Start on the **Detect** page: upload a clip. Or click *Load synthetic demo* in the sidebar to try the "
@@ -273,7 +291,11 @@ def page_detect():
                                      "Adds about 50 ms per frame.")
         a, b = st.columns(2)
         blur = a.checkbox("Blur faces and plates in the output video", True)
-        level = b.selectbox("Blur strength", ["standard", "strict"], help="strict pixelates each whole road user.")
+        # Seen from straight above there is no "head" or "plate band" in a box, so the region heuristics miss;
+        # blur each whole road user instead.
+        level = b.selectbox("Blur strength", ["standard", "strict"], index=1 if overhead else 0,
+                            help="strict pixelates each whole road user. Use it for drone footage: the head and "
+                                 "plate regions that 'standard' blurs only make sense for a camera looking from the side.")
         conf_show = st.checkbox("Show confidence on labels", False)
 
     if up is None:
@@ -285,7 +307,8 @@ def page_detect():
     try:
         m = read_metadata(str(src_tmp))
     except ValueError as e:
-        st.error(str(e))
+        st.error(f"{e} If it plays elsewhere, the codec may be unsupported (HEVC from some phones): re-export it as "
+                 "H.264 MP4 and upload it again.")
         return
     cols = st.columns(4)
     cols[0].metric("Duration (s)", m["duration_s"])
@@ -339,6 +362,7 @@ def page_detect():
     if overhead:
         S = Settings()
         S.ground_point = "center"
+        S.privacy_level = "strict"
         write_json(d / "settings.json", S.to_dict())
     with open(d / "detections.csv", "w", newline="") as f:
         w = csv.writer(f)
@@ -350,9 +374,19 @@ def page_detect():
     write_json(d / "meta.json", m)
     st.session_state["rid"] = new_id
     prog.progress(1.0, text="Done")
-    st.success(f"Processed {n} frames in {m['seconds']} s. {len(rows)} detections saved.")
+    if n == 0:
+        st.error("No frames could be read from this video. Try re-exporting it as H.264 MP4 (for example with "
+                 "HandBrake or your phone's share/export option) and upload it again.")
+    elif not rows:
+        st.error(f"The model ran on {n} frames but found **no road users**, so there is nothing to analyse. Things to "
+                 "try: check *How was it filmed?* matches the footage (drone footage needs *From above*), lower "
+                 "*Detection confidence* under More settings, or raise *Detection size*.")
+    else:
+        st.success(f"Processed {n} frames in {m['seconds']} s. {len(rows)} detections saved.")
     if tracker.warning:
         st.warning(tracker.warning)
+    if blind_spot(m):
+        st.warning(blind_spot(m))
     if tracker.motion is not None:
         ms = tracker.motion.summary((m["width"], m["height"]))
         if ms["max_shift_px"] < 3:
@@ -392,6 +426,18 @@ def point_editor(pts: list, n: int, key: str) -> list:
     return [[float(r.x), float(r.y)] for r in df.itertuples() if pd.notna(r.x) and pd.notna(r.y)][:n]
 
 
+def show_calibration_hints(method: str, pts: list, w_m: float, l_m: float, size) -> None:
+    """Geometry warnings for the clicked points before they are saved."""
+    try:
+        cal = (Calibration.from_points(pts, w_m, l_m, size) if method == "rect"
+               else Calibration.from_two_points(pts[0], pts[1], w_m, size))
+    except CalibrationError as e:
+        st.error(str(e))
+        return
+    for h in cal.quality_hints(check_shape=method == "rect"):
+        st.warning(h)
+
+
 def page_calibrate():
     st.header("2. Calibrate (turn pixels into metres)")
     if need_run():
@@ -408,6 +454,8 @@ def page_calibrate():
                         "the centre for a camera looking straight down.")
     if (view == "overhead") != (S.ground_point == "center"):
         S.ground_point = "center" if view == "overhead" else "bottom"
+        if view == "overhead":
+            S.privacy_level = "strict"      # head / plate regions do not exist from straight above
         write_json(run_dir(rid) / "settings.json", S.to_dict())
     methods = ["rect", "line"] if view == "overhead" else ["rect"]
     method = b.radio("Calibrate with", methods, horizontal=True,
@@ -441,11 +489,13 @@ def page_calibrate():
     pts = st.session_state[key]
     chk_key = f"chk_{rid}"
     chk = st.session_state.setdefault(chk_key, [])
-    target = "cal"
-    if saved is not None:
-        target = st.radio("Clicks on the image add", ["cal", "chk"], horizontal=True, key=f"target_{rid}",
-                          format_func=lambda t: {"cal": "Calibration points (yellow)",
-                                                 "chk": "Accuracy-check points (pink)"}[t])
+    roi_key = f"roi_{rid}"
+    roi_pts = st.session_state.setdefault(roi_key, [list(p) for p in load_roi(rid)])
+    targets = ["cal"] + (["chk"] if saved is not None else []) + ["roi"]
+    target = st.radio("Clicks on the image add", targets, horizontal=True, key=f"target_{rid}",
+                      format_func=lambda t: {"cal": "Calibration points (yellow)",
+                                             "chk": "Accuracy-check points (pink)",
+                                             "roi": "Road area outline (green, optional)"}[t])
 
     c1, c2 = st.columns([3, 2])
     with c2:
@@ -463,6 +513,7 @@ def page_calibrate():
     shown = cv2.resize(frame, (DISPLAY_W, int(H * scale)))
     draw_points(shown, pts, scale, (0, 220, 255), closed=len(pts) == 4)
     draw_points(shown, chk, scale, (200, 80, 255), closed=False)
+    draw_points(shown, roi_pts, scale, (80, 220, 80), closed=len(roi_pts) >= 3)
     with c1:
         try:
             from streamlit_image_coordinates import streamlit_image_coordinates
@@ -477,6 +528,8 @@ def page_calibrate():
         p = [round(click["x"] * sx, 1), round(click["y"] * sx, 1)]
         if target == "chk":
             st.session_state[chk_key] = (chk + [p])[-2:]
+        elif target == "roi":
+            roi_pts.append(p)
         elif len(pts) < n_pts:
             pts.append(p)
         st.rerun()
@@ -484,7 +537,9 @@ def page_calibrate():
     with c2:
         if len(pts) < n_pts:
             st.info(f"Click {n_pts - len(pts)} more point(s) on the image.")
-        elif st.button("Save calibration", type="primary", width="stretch"):
+        elif pts != saved_in.get("points"):
+            show_calibration_hints(method, pts, w_m, l_m if method == "rect" else w_m, (W, H))
+        if len(pts) == n_pts and st.button("Save calibration", type="primary", width="stretch"):
             try:
                 if method == "rect":
                     cal = Calibration.from_points(pts, w_m, l_m, (W, H))
@@ -504,6 +559,25 @@ def page_calibrate():
             edited = point_editor(pts, n_pts, f"ed_{rid}_{method}")
             if edited != pts:
                 st.session_state[key] = pts = edited
+        saved_roi = load_roi(rid)
+        with st.expander(f"Road area: {'saved, ' if saved_roi else ''}{len(roi_pts)} points",
+                         expanded=target == "roi"):
+            st.caption("Optional. Choose *Road area outline* above and click around the roadway and crosswalks. "
+                       "Road users outside it (parked cars in a lot, people on the sidewalk) are ignored, so they "
+                       "cannot cause false alarms. Leave it empty to use the whole frame.")
+            a, b, c = st.columns(3)
+            if a.button("Save area", disabled=len(roi_pts) < 3 or roi_pts == saved_roi, type="primary"):
+                write_json(run_dir(rid) / "roi.json", {"points": roi_pts})
+                st.rerun()
+            if b.button("Undo point", disabled=not roi_pts):
+                roi_pts.pop()
+                st.rerun()
+            if c.button("Clear area", disabled=not roi_pts and not saved_roi):
+                roi_pts.clear()
+                (run_dir(rid) / "roi.json").unlink(missing_ok=True)
+                st.rerun()
+            if roi_pts != saved_roi:
+                st.caption("Not saved yet.")
 
     cal, d = load_calibration(rid)
     if cal is None:
@@ -521,7 +595,7 @@ def page_calibrate():
             st.success(msg)
         next_button("Results", "See the results")
     st.subheader("Check it")
-    for h in cal.quality_hints():
+    for h in cal.quality_hints(check_shape=d.get("input", {}).get("method", "rect") == "rect"):
         st.warning(h)
     a, b = st.columns(2)
     a.image(rgb(cal.preview(frame)), caption="Bird's-eye view of the road. Straight lines should look straight and "
@@ -568,7 +642,8 @@ def thresholds_ui(S: Settings) -> None:
             st.rerun()
         if b.button("Reset to defaults"):
             D = Settings()
-            D.ground_point = S.ground_point    # that one belongs to the camera, not the thresholds
+            D.ground_point = S.ground_point    # these belong to the camera, not the thresholds
+            D.privacy_level = S.privacy_level
             write_json(run_dir(rid) / "settings.json", D.to_dict())
             st.rerun()
 
@@ -590,14 +665,28 @@ def page_results():
     c[2].metric("Serious", int(sev.get("serious", 0)))
     c[3].metric("Moderate", int(sev.get("moderate", 0)))
     c[4].metric("Candidate", int(sev.get("candidate", 0)))
-    st.caption(f"Tracks left out: {stats['dropped_riders']} riders (person on a bike counted once), "
+    rate = lambda v: "n/a" if v is None else str(v)
+    c = st.columns(4)
+    c[0].metric("Vehicles", stats["road_users"].get("veh", 0))
+    c[1].metric("Events per 100 vehicles", rate(stats["events_per_100_vehicles"]),
+                help="Raw counts grow with traffic. Rates let you compare a busy clip with a quiet one.")
+    c[2].metric("Events per 1,000 pairs", rate(stats["events_per_1000_pairs"]),
+                help="Pairs = two road users (of a kind the engine checks) on the road at the same time.")
+    c[3].metric("Events per hour", rate(stats["events_per_hour"]))
+    per_kind = stats["events_per_1000_pairs_by_kind"]
+    st.caption("Per 1,000 pairs on the road together: " + ", ".join(
+        f"{KIND_LABEL[k].lower()} {rate(per_kind[k])} ({stats['pairs_together'][k]} pair"
+        f"{'' if stats['pairs_together'][k] == 1 else 's'})" for k in per_kind)
+        + f". Road users: {stats['road_users'].get('ped', 0)} pedestrians, {stats['road_users'].get('bike', 0)} "
+          f"bicycles, {stats['road_users'].get('veh', 0)} vehicles.")
+    roi_note = (f"{stats['dropped_outside_roi']} outside the road area, " if load_roi(rid) else "")
+    st.caption(f"Tracks left out: {roi_note}{stats['dropped_riders']} riders (person on a bike counted once), "
                f"{stats['dropped_short']} too short (mostly flicker or duplicate boxes), {stats['dropped_out_of_range']} out of range. "
                f"Flags filtered out as likely false alarms: {stats.get('filtered_duplicate_detection', 0)} one road user "
                f"detected twice, {stats.get('filtered_ttc_too_brief', 0)} too brief, "
                f"{stats.get('filtered_no_evasive_action', 0)} driving past a stopped road user without braking.")
-    if meta.get("view") == "overhead" and not finds_people(meta.get("model_used", "-obb")):
-        st.caption("Overhead footage with a vehicles-only model: pedestrians and bicycles are not detected, so only "
-                   "vehicle-vehicle conflicts appear.")
+    if blind_spot(meta):
+        st.warning(blind_spot(meta))
     thresholds_ui(Settings.from_dict(S.to_dict()))
     l, r = st.columns([3, 2])
     with l:
@@ -617,9 +706,68 @@ def page_results():
                       args=("Event Review",), kwargs={f"ev_{rid}": pick})
         else:
             st.success("No events flagged with these thresholds. Try loosening them, or check the calibration.")
+    export_ui(S, stats, tracks, events)
+
+
+def tracks_csv(tracks) -> str:
+    """Every smoothed trajectory sample in map metres, so a reviewer can recompute any number."""
+    out = ["track_id,segment,class,group,time_s,x_m,y_m,vx_mps,vy_mps,speed_mps"]
+    for t in tracks:
+        for k in range(len(t.t)):
+            out.append(f"{t.id},{t.seg},{t.cls},{t.group},{t.t[k]:.2f},{t.xy[k, 0]:.3f},{t.xy[k, 1]:.3f},"
+                       f"{t.v[k, 0]:.3f},{t.v[k, 1]:.3f},{t.speed[k]:.3f}")
+    return "\n".join(out) + "\n"
+
+
+def export_ui(S: Settings, stats: dict, tracks, events) -> None:
+    with st.expander("Export this run (events, tracks, settings, labels)"):
+        st.caption("Everything needed to check the numbers or reproduce the run. The bundle holds no video frames.")
+        _, cd = load_calibration(rid)
+        bundle = {"recording": {k: v for k, v in meta.items()}, "calibration": cd, "road_area": load_roi(rid),
+                  "settings": S.to_dict(), "stats": stats, "events": events,
+                  "labels": read_json(run_dir(rid) / "labels.json", {})}
+        a, b, c = st.columns(3)
+        a.download_button("run.json (everything)", json.dumps(bundle, indent=1, default=str),
+                          f"nearmiss_{rid}.json", "application/json")
+        b.download_button("tracks.csv", tracks_csv(tracks), f"tracks_{rid}.csv", "text/csv")
+        c.download_button("labels.json", json.dumps(bundle["labels"], indent=1), f"labels_{rid}.json",
+                          "application/json")
+        up = st.file_uploader("Import labels.json (restores Event Review labels, e.g. from another computer)",
+                              type=["json"], key=f"lab_up_{rid}")
+        if up is not None and st.button("Replace this recording's labels with the file"):
+            try:
+                store = json.loads(up.getvalue())
+                assert isinstance(store, dict) and isinstance(store.get("events", []), list)
+            except Exception:
+                st.error("That file is not a NearMiss labels.json.")
+            else:
+                write_json(run_dir(rid) / "labels.json", store)
+                st.success(f"Imported {len(store.get('events', []))} labels and {len(store.get('missed', []))} "
+                           "missed events.")
 
 
 # ================================================================== EVENT REVIEW
+# T / F / U label the event, left / right arrows move between events. Streamlit has no key bindings, so a tiny
+# script in a zero-height frame listens on the page and clicks the matching button. It is added once per tab,
+# skips keys typed into fields or the video player, and does nothing on pages without those buttons.
+REVIEW_KEYS_JS = """<script>
+const doc = window.parent.document;
+if (!doc.nearmissKeys) {
+  doc.nearmissKeys = true;
+  const keys = {t: "%s", f: "%s", u: "%s", ArrowLeft: "< Previous", ArrowRight: "Next >"};
+  doc.addEventListener("keydown", (e) => {
+    const t = e.target, tag = (t.tagName || "").toLowerCase();
+    if (["input", "textarea", "select", "video"].includes(tag) || t.isContentEditable) return;
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    const want = keys[e.key.length === 1 ? e.key.toLowerCase() : e.key];
+    if (!want) return;
+    const btn = [...doc.querySelectorAll("button")].find(b => b.innerText.trim() === want && !b.disabled);
+    if (btn) { e.preventDefault(); btn.click(); }
+  });
+}
+</script>""" % (LABEL_TEXT["tp"], LABEL_TEXT["fp"], LABEL_TEXT["unsure"])
+
+
 def step_event(key: str, delta: int, n: int) -> None:
     st.session_state[key] = min(max(st.session_state.get(key, 0) + delta, 0), n - 1)
 
@@ -658,6 +806,12 @@ def page_review():
     ev = events[idx]
     reviewed = sum(1 for e in events if e.get("label"))
     st.progress(reviewed / len(events), text=f"Reviewed {reviewed} of {len(events)}")
+    if hasattr(st, "iframe"):                      # Streamlit >= 1.5x; components.html is deprecated there
+        st.iframe(REVIEW_KEYS_JS, height=1)
+    else:
+        components.html(REVIEW_KEYS_JS, height=0)
+    st.caption("Keyboard: **T** real near miss, **F** false alarm, **U** unsure, **←/→** previous/next event. "
+               "Click an empty part of the page first if a key does nothing.")
 
     c1, c2 = st.columns([3, 2])
     with c1:
@@ -720,7 +874,9 @@ def page_review():
 AI_TEXT = """Fill this in honestly before you submit. Example structure:
 - Tools: [e.g. Claude] helped with [what: debugging, explaining the homography maths, drafting the UI layout].
 - Written by me: [which files / functions you wrote or rewrote yourself].
-- Pretrained models: YOLOv8 (Ultralytics, COCO classes) and ByteTrack for detection and tracking. I did not train them.
+- Pretrained models: YOLOv8 (Ultralytics, COCO classes) for street-level video, YOLO11-OBB (Ultralytics, trained on the
+  DOTA aerial dataset; vehicles only) for drone video, and ByteTrack for tracking. I did not train them.
+  [If you used nearmiss-visdrone.pt: I fine-tuned YOLO on VisDrone with tools/train_visdrone_colab.ipynb.]
 - Libraries: Streamlit, OpenCV, NumPy, pandas, Ultralytics.
 - I can explain: [calibration, TTC, closest approach, PET, validation]."""
 
@@ -747,7 +903,18 @@ def page_report():
     st.caption("Precision = real / (real + false alarms). Recall can only be bounded from above, because the app cannot "
                "know about events nobody marked as missed.")
     if summ["unreviewed"]:
+        st.warning(f"{summ['unreviewed']} of {summ['events_flagged']} flagged events are not reviewed yet, so the "
+                   "precision above describes only the ones you looked at.")
         st.button(f"Review the {summ['unreviewed']} remaining event(s) first", on_click=go, args=("Event Review",))
+    if summ["by_kind"]:
+        st.write("**By type of conflict**")
+        st.dataframe(pd.DataFrame([
+            {"type": KIND_LABEL[k], "flagged": v["flagged"], "real": v["tp"], "false alarms": v["fp"],
+             "unsure": v["unsure"], "not reviewed": v["unreviewed"],
+             "precision": "n/a" if v["precision"] is None else f"{v['precision']:.0%}"}
+            for k, v in summ["by_kind"].items()]), hide_index=True, width="stretch")
+    if blind_spot(meta):
+        st.warning(blind_spot(meta))
     with st.expander("All numbers"):
         st.json(summ)
     _, cd = load_calibration(rid)
@@ -756,7 +923,11 @@ def page_report():
         frames = {e["id"]: jpg_b64(event_frame(source_path(rid), det, e, S.privacy_level, True)) for e in events[:30]}
         page = build_report_html(meta.get("name", rid), {k: v for k, v in meta.items() if k != "settings"},
                                  {k: cd[k] for k in ("width_m", "length_m", "input", "checks") if k in cd}, S, events, summ,
-                                 disclosure, png_b64(topdown_map(tracks, events, cal)), frames)
+                                 disclosure, png_b64(topdown_map(tracks, events, cal)), frames,
+                                 notes=[n.replace("**", "") for n in [blind_spot(meta)] if n],
+                                 exposure={k: stats[k] for k in ("road_users", "pairs_together", "events_per_100_vehicles",
+                                                                 "events_per_1000_pairs",
+                                                                 "events_per_1000_pairs_by_kind", "events_per_hour")})
         st.session_state[f"report_{rid}"] = page
     if f"report_{rid}" in st.session_state:
         st.download_button("Download report.html (print to PDF)", st.session_state[f"report_{rid}"],
@@ -799,8 +970,9 @@ wrong (a curving path, a different lane). The Results page says how many flags e
 model misses far or small road users and can confuse classes. Every flag needs a human look, which is what Event Review is for.
 This tool finds where road users came close. It does **not** predict crashes or certify an intersection as safe.
 
-**Privacy.** Faces and plates are pixelated by position heuristics (head and lower-box regions), which is not perfect.
-Footage stays on this computer.
+**Privacy.** For street-level footage, faces and plates are pixelated by position heuristics (head and lower-box
+regions), which is not perfect: anything the detector misses is not blurred. For drone footage those regions do not
+exist, so each whole road user is pixelated instead. Footage stays on this computer.
 """)
 
 

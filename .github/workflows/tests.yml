@@ -1,0 +1,18 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      # The engine tests need no model weights, so skip ultralytics / torch (a multi-GB install).
+      - run: pip install numpy pandas "opencv-python-headless<5" pytest
+      - run: python -m pytest tests -q
