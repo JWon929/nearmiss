@@ -143,12 +143,15 @@ def cut_clip(src_video: str, out_path: str, t0: float, t1: float) -> bool:
 
 # ------------------------------------------------------------------ top-down map
 def topdown_map(tracks: Sequence[Track], events: Sequence[Dict], calib: Calibration,
-                size: int = 900, heat: bool = True, show_tracks: bool = True) -> np.ndarray:
-    """Bird's-eye picture: trajectories, a heat layer of events, event markers, a metre scale bar."""
+                size: int = 900, heat: bool = True, show_tracks: bool = True,
+                zones: Sequence[Tuple[str, np.ndarray, Tuple[int, int, int]]] = ()) -> np.ndarray:
+    """Bird's-eye picture: trajectories, a heat layer of events, event markers, a metre scale bar.
+    `zones` are (name, polygon in map metres, BGR colour) outlines drawn under everything else."""
     pts = [t.xy for t in tracks if len(t.xy)]
     pts += [np.array([[e["x"], e["y"]] for e in events])] if events else []
     corners, _ = calib.img_to_map(calib.image_points)
     pts.append(np.asarray(corners))
+    pts += [np.asarray(p) for _, p, _ in zones]
     allp = np.vstack(pts)
     lo, hi = np.percentile(allp, 1, axis=0) - 3.0, np.percentile(allp, 99, axis=0) + 3.0
     span = np.maximum(hi - lo, 1.0)
@@ -160,6 +163,15 @@ def topdown_map(tracks: Sequence[Track], events: Sequence[Dict], calib: Calibrat
         return np.c_[20 + (p[:, 0] - lo[0]) * s, h - 20 - (p[:, 1] - lo[1]) * s]
 
     img = np.full((h, w, 3), 245, np.uint8)
+    for name, poly, col in zones:
+        q = px(poly).astype(np.int32)
+        tint = img.copy()
+        cv2.fillPoly(tint, [q], col)
+        img = cv2.addWeighted(tint, 0.18, img, 0.82, 0)
+        cv2.polylines(img, [q], True, col, 2, cv2.LINE_AA)
+        c = q.mean(axis=0).astype(int)
+        cv2.putText(img, name, (int(c[0]) - 4 * len(name), int(c[1])), cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1,
+                    cv2.LINE_AA)
     cv2.polylines(img, [px(corners).astype(np.int32)], True, (170, 170, 170), 2, cv2.LINE_AA)
     if show_tracks:
         for t in tracks:
@@ -215,7 +227,7 @@ def events_table(events: Sequence[Dict]) -> List[Dict]:
         rows.append({
             "id": e["id"], "time_s": e["t_peak"], "type": e["kind_label"], "severity": e["severity"],
             "closest_m": e["d_min_m"], "ttc_min_s": e["ttc_min_s"], "pet_s": e["pet_s"],
-            "below_3ft": e.get("below_3ft"), "why": "; ".join(e.get("reasons", [])),
+            "below_3ft": e.get("below_3ft"), "zone": e.get("zone", ""), "why": "; ".join(e.get("reasons", [])),
             "label": e.get("label") or "",
         })
     return rows
@@ -225,7 +237,7 @@ def build_report_html(title: str, meta: Dict, calib_info: Dict, S: Settings, eve
                       validation: Dict, ai_disclosure: str, map_png_b64: str,
                       frames_b64: Optional[Dict[str, str]] = None, notes: Sequence[str] = (),
                       exposure: Optional[Dict] = None, info: Optional[Dict] = None, explain=None,
-                      speeds: Optional[Dict] = None) -> str:
+                      speeds: Optional[Dict] = None, zone_rows: Optional[Sequence[Dict]] = None) -> str:
     """One self-contained HTML page (print it to PDF from the browser). `notes` are blind spots to state up front,
     `info` the recording details sheet, `explain` turns an event into a plain-language sentence."""
     esc = html.escape
@@ -233,6 +245,13 @@ def build_report_html(title: str, meta: Dict, calib_info: Dict, S: Settings, eve
     info_rows = "".join(f"<tr><th>{esc(k.replace('_', ' '))}</th><td>{esc(str(v))}</td></tr>"
                         for k, v in (info or {}).items() if v not in ("", None, 0))
     info_html = f"<h2>Recording details</h2><table>{info_rows}</table>" if info_rows else ""
+    zones_html = ""
+    if zone_rows:
+        cols = ["zone", "type", "pedestrians", "bicycles", "vehicles", "events", "serious", "moderate", "candidate",
+                "events_per_100_users"]
+        zones_html = ("<h2>Zones</h2><table><tr>" + "".join(f"<th>{c.replace('_', ' ')}</th>" for c in cols) + "</tr>"
+                      + "".join("<tr>" + "".join(f"<td>{esc(str(r[c] if r[c] is not None else 'n/a'))}</td>"
+                                                 for c in cols) + "</tr>" for r in zone_rows) + "</table>")
     speed_html = ""
     if speeds and speeds.get("vehicles"):
         mph = lambda v: f"{v * 2.23694:.0f} mph"
@@ -255,7 +274,8 @@ def build_report_html(title: str, meta: Dict, calib_info: Dict, S: Settings, eve
     rows = ""
     for r in events_table(events):
         rows += "<tr>" + "".join(f"<td>{esc(str(r[k]))}</td>" for k in
-                                 ["id", "time_s", "type", "severity", "closest_m", "ttc_min_s", "pet_s", "label"]) + "</tr>"
+                                 ["id", "time_s", "type", "severity", "closest_m", "ttc_min_s", "pet_s", "zone",
+                                  "label"]) + "</tr>"
     cards = ""
     for e in events:
         img = frames_b64.get(e["id"])
@@ -278,9 +298,9 @@ calibration below.</p>{notes_html}
 {info_html}<h2>Recording</h2><pre>{esc(json.dumps(meta, indent=1))}</pre>{exposure_html}{speed_html}
 <h2>Calibration</h2><pre>{esc(json.dumps(calib_info, indent=1))}</pre>
 <h2>Thresholds used</h2><pre>{esc(json.dumps(S.to_dict(), indent=1))}</pre>
-<h2>Top-down map</h2><img src='data:image/png;base64,{map_png_b64}'>
+<h2>Top-down map</h2><img src='data:image/png;base64,{map_png_b64}'>{zones_html}
 <h2>Events ({len(events)})</h2><table><tr><th>ID</th><th>t (s)</th><th>Type</th><th>Severity</th><th>Closest (m)</th>
-<th>Min TTC (s)</th><th>PET (s)</th><th>My label</th></tr>{rows}</table>{cards}
+<th>Min TTC (s)</th><th>PET (s)</th><th>Zone</th><th>My label</th></tr>{rows}</table>{cards}
 <h2>Validation (my own review of the flags)</h2>{unreviewed}{kind_table}<pre>{esc(v)}</pre>
 <h2>AI use disclosure</h2><p>{esc(ai_disclosure).replace(chr(10), '<br>')}</p>
 </body></html>"""

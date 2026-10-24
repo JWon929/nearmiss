@@ -60,6 +60,19 @@ on the road at the same time (overall and per conflict type), and per hour.
 - **Car-size check (drone footage):** if cars measure far from 4-5 m long, the calibration scale is probably off.
 - Every event has a plain-language sentence, e.g. *"A car (9.3 m/s, 21 mph) and a pedestrian came within 1.4 m..."*
 
+## Named zones
+On **Calibrate**, choose *Named zone outline*, click around a crosswalk, stop-line area or bike lane, and name it.
+Every event is tagged with its zone, and Results -> *Zones* counts the road users through each zone and the events per
+100 of them. Zones show on the top-down map and in the report.
+
+## Slow-motion near-miss video
+Results -> *Slow-motion video* writes a copy of the blurred result video that slows down (2-8x) around each flagged
+event, with a coloured border and a banner naming the event. *Highlights only* keeps just the slowed parts.
+
+## Reusing a calibration
+A fixed camera filmed several times from the same spot: on **Calibrate**, *Reuse a calibration* copies the calibration,
+road area and zones from another recording with the same frame size.
+
 ## Second reviewer
 Report -> *Second reviewer* builds `review_pack.html`: one file with blurred frames and label buttons that anyone can
 open in a browser. Your own labels are left out. Load the JSON they send back to see percent agreement and Cohen's
@@ -71,7 +84,8 @@ the analysis, labels, blurred video and report keep working.
 
 ## Reviewing and exporting
 - Event Review keys: **T** real near miss, **F** false alarm, **U** unsure, **←/→** previous/next.
-  Filter by type, severity and review status; add a note to any label.
+  Filter by type, severity, zone and review status; *Next unreviewed* jumps to the next event without a label; add a
+  note to any label.
 - Every page shows a settings line (model, calibration and its check error, thresholds, road area), and Report has a
   recording-details sheet (date, place, weather, lighting, camera) that is printed in the report.
 - The Report page shows precision per conflict type and how many events are still unreviewed.

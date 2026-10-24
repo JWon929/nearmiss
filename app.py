@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import csv
 import json
+from html import escape as html_escape
 import shutil
 import time
 import uuid
@@ -37,6 +38,8 @@ from engine.insights import (MPS_TO_MPH, explain_event, sensitivity, speed_summa
                              vehicle_size_check)
 from engine.motion import load_motion
 from engine.roi import as_polygon as roi_polygon
+from engine.slowmo import make_slowmo
+from engine.zones import ZONE_COLORS, ZONE_KINDS, tag_events, zone_polygons_map, zone_summary
 from video_utils import AnnotatedVideoWriter, grab_frame, read_metadata
 
 RUNS = Path(__file__).parent / "runs"
@@ -44,9 +47,39 @@ RUNS.mkdir(exist_ok=True)
 CSV_HEADER = ["frame", "time_s", "track_id", "class_name", "confidence", "x1", "y1", "x2", "y2", "center_x", "center_y"]
 DISPLAY_W = 900
 PAGES = ["Detect", "Calibrate", "Results", "Event Review", "Report", "Method"]
+PAGE_ICONS = {"Detect": ":material/videocam:", "Calibrate": ":material/straighten:", "Results": ":material/analytics:",
+              "Event Review": ":material/fact_check:", "Report": ":material/description:", "Method": ":material/menu_book:"}
 LABEL_TEXT = {"tp": "Real near miss", "fp": "False alarm", "unsure": "Unsure"}
+SEV_HEX = {"serious": "#c62828", "moderate": "#ef6c00", "candidate": "#b28704", "none": "#6b7280"}
 
-st.set_page_config(page_title="NearMiss", layout="wide")
+st.set_page_config(page_title="NearMiss", page_icon=":material/traffic:", layout="wide")
+st.markdown("""<style>
+/* metric cards */
+div[data-testid="stMetric"] {border: 1px solid rgba(128,128,128,.25); border-radius: 10px; padding: 10px 14px;
+  background: rgba(128,128,128,.04);}
+div[data-testid="stMetricLabel"] p {font-size: .82rem; opacity: .8;}
+/* severity badge and page intro */
+.nm-badge {display: inline-block; padding: 2px 10px; border-radius: 999px; color: #fff; font-weight: 600;
+  font-size: .85rem; letter-spacing: .02em;}
+.nm-intro {opacity: .8; margin-top: -.6rem; margin-bottom: .6rem;}
+.nm-step {font-size: .78rem; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; opacity: .6;
+  margin-bottom: -.4rem;}
+section[data-testid="stSidebar"] div[role="radiogroup"] label {padding: 3px 0;}
+</style>""", unsafe_allow_html=True)
+
+
+def page_header(page: str, title: str, intro: str = "") -> None:
+    """Step number, title and a one-line explanation, the same on every page."""
+    if page in PAGES[:-1]:
+        st.markdown(f"<div class='nm-step'>Step {PAGES.index(page) + 1} of {len(PAGES) - 1}</div>",
+                    unsafe_allow_html=True)
+    st.title(title)
+    if intro:
+        st.markdown(f"<div class='nm-intro'>{intro}</div>", unsafe_allow_html=True)
+
+
+def badge(severity: str) -> str:
+    return f"<span class='nm-badge' style='background:{SEV_HEX.get(severity, '#6b7280')}'>{severity.capitalize()}</span>"
 
 
 # ------------------------------------------------------------------ run storage
@@ -120,6 +153,17 @@ def load_roi(rid: str) -> list:
     return read_json(run_dir(rid) / "roi.json", {}).get("points", [])
 
 
+def load_zones(rid: str) -> list:
+    """Named zones: [{"name", "kind", "points"}], drawn on the calibration frame."""
+    return read_json(run_dir(rid) / "zones.json", {}).get("zones", [])
+
+
+def zone_overlays(cal) -> list:
+    zones = load_zones(rid)
+    return [(z["name"], p, ZONE_COLORS[i % len(ZONE_COLORS)])
+            for i, (z, p) in enumerate(zip(zones, zone_polygons_map(zones, cal))) if p is not None]
+
+
 @st.cache_data(show_spinner="Analysing tracks...")
 def cached_analysis(rid: str, csv_mtime: float, cal_json: str, settings_json: str, motion_mtime: float,
                     roi_json: str = "[]"):
@@ -142,6 +186,7 @@ def get_analysis(rid: str):
                                                  json.dumps(load_roi(rid)))
     events = [dict(e) for e in events]
     validation.apply_labels(events, read_json(run_dir(rid) / "labels.json", {}))
+    tag_events(events, load_zones(rid), cal)
     return cal, S, det, tracks, stats, events
 
 
@@ -212,7 +257,7 @@ def pick_recording() -> None:
 
 
 with st.sidebar:
-    st.title("NearMiss")
+    st.markdown("## :material/traffic: NearMiss")
     st.caption("Screening tool for potential traffic conflicts. Not a crash predictor.")
     runs = list_runs()
     if runs:
@@ -225,9 +270,11 @@ with st.sidebar:
     # The option labels must not change between runs: Streamlit treats a radio whose labels changed as a new widget
     # and resets it to the first page (labelling the first event used to jump back to Detect). So the ticks go below.
     page = st.radio("Steps", PAGES, key="page",
-                    format_func=lambda p: f"{PAGES.index(p) + 1}. {p}" if p != "Method" else p)
-    if any(done.values()):
-        st.caption("Done: " + ", ".join(f"✓ {p}" for p in PAGES if done.get(p)))
+                    format_func=lambda p: f"{PAGE_ICONS[p]} " + (f"{PAGES.index(p) + 1}. {p}" if p != "Method" else p))
+    n_done = sum(bool(done.get(p)) for p in PAGES[:4])
+    if st.session_state.get("rid"):
+        st.progress(n_done / 4, text=f"{n_done} of 4 steps done" + (": " + ", ".join(
+            p for p in PAGES if done.get(p)) if n_done else ""))
     st.divider()
     if demo.demo_available() and st.button("Load synthetic demo"):
         st.session_state["rid"] = create_demo_run()
@@ -293,9 +340,9 @@ def need_run() -> bool:
 
 # ================================================================== DETECT
 def page_detect():
-    st.header("1. Detect and track road users")
-    st.write("Upload an intersection clip. Works best from a camera that stays still (tripod, pole, hovering drone). "
-             "If the camera drifts or zooms, NearMiss lines every frame up with the first one.")
+    page_header("Detect", "Detect and track road users",
+                "Upload an intersection clip. Works best from a camera that stays still (tripod, pole, hovering "
+                "drone). If the camera drifts or zooms, NearMiss lines every frame up with the first one.")
     up = st.file_uploader("Intersection video", type=["mp4", "mov", "m4v"])
     view = st.radio("How was it filmed?", ["angled", "overhead"], horizontal=True, key="det_view",
                     format_func=lambda v: {"angled": "From the side or a pole (looking at the road at an angle)",
@@ -485,14 +532,79 @@ def show_calibration_hints(method: str, pts: list, w_m: float, l_m: float, size)
         st.warning(h)
 
 
+def save_zone(zones: list, name: str, kind: str, draft: list) -> None:
+    """Button callback (runs before the widgets are drawn, so the name box can be emptied for the next zone)."""
+    zones.append({"name": name, "kind": kind, "points": list(draft)})
+    write_json(run_dir(rid) / "zones.json", {"zones": zones})
+    draft.clear()
+    st.session_state[f"zone_name_{rid}"] = ""
+
+
+def zones_editor(draft: list, open_it: bool) -> None:
+    """Name the outlined zone and keep a list of saved zones (crosswalks, bike lanes...)."""
+    zones = load_zones(rid)
+    with st.expander(f"Named zones: {len(zones)} saved", expanded=open_it, icon=":material/pin_drop:"):
+        st.caption("Optional. Choose *Named zone outline* above, click around a crosswalk, bike lane or other area, "
+                   "then name it. Events are tagged with their zone and Results counts events and road users per zone.")
+        a, b = st.columns(2)
+        name = a.text_input("Zone name", key=f"zone_name_{rid}", placeholder="e.g. North crosswalk")
+        kind = b.selectbox("Type", ZONE_KINDS, key=f"zone_kind_{rid}")
+        a, b, c = st.columns(3)
+        taken = name.strip() in {z["name"] for z in zones}
+        a.button("Save zone", type="primary", disabled=len(draft) < 3 or not name.strip() or taken, width="stretch",
+                 on_click=save_zone, args=(zones, name.strip(), kind, draft))
+        if b.button("Undo point", key=f"zone_undo_{rid}", disabled=not draft, width="stretch"):
+            draft.pop()
+            st.rerun()
+        if c.button("Clear outline", key=f"zone_clear_{rid}", disabled=not draft, width="stretch"):
+            draft.clear()
+            st.rerun()
+        if taken:
+            st.caption("A zone with that name already exists.")
+        elif draft and len(draft) < 3:
+            st.caption(f"{len(draft)} point(s) so far: click at least 3.")
+        for i, z in enumerate(zones):
+            l, r = st.columns([4, 1])
+            l.markdown(f"**{z['name']}** · {z.get('kind', 'other')} · {len(z['points'])} points")
+            if r.button("Delete", key=f"zone_del_{rid}_{i}"):
+                zones.pop(i)
+                write_json(run_dir(rid) / "zones.json", {"zones": zones})
+                st.rerun()
+
+
+def reuse_calibration_ui() -> None:
+    """Fixed cameras: copy the calibration (and road area and zones) from another recording of the same spot."""
+    size = [meta.get("width"), meta.get("height")]
+    same = []
+    for r, label in list_runs():
+        cd = read_json(run_dir(r) / "calibration.json") if r != rid else None
+        if cd and list(cd.get("frame_size", [])) == size:
+            same.append((r, label))
+    if not same:
+        return
+    with st.expander(f"Reuse a calibration from another recording ({len(same)} with the same frame size)"):
+        st.caption("Only for a camera that stayed in exactly the same place and zoom. Copies the calibration, road "
+                   "area and zones. Check the result with the accuracy check below.")
+        src = st.selectbox("Copy from", [r for r, _ in same], format_func=dict(same).get, key=f"reuse_{rid}")
+        if st.button("Copy calibration, road area and zones"):
+            for f in ("calibration.json", "roi.json", "zones.json"):
+                if (run_dir(src) / f).exists():
+                    shutil.copy(run_dir(src) / f, run_dir(rid) / f)
+            for k in [k for k in st.session_state if rid in k and k.startswith(("pts_", "roi_", "chk_"))]:
+                del st.session_state[k]
+            st.rerun()
+
+
 def page_calibrate():
-    st.header("2. Calibrate (turn pixels into metres)")
+    page_header("Calibrate", "Calibrate", "Turn pixels into metres. Optionally outline the road area and name zones "
+                "such as crosswalks.")
     if need_run():
         return
     if not has_source(rid):
         st.info("The original video of this recording was deleted for privacy, so the calibration cannot be redone. "
                 "The saved calibration is still used for the analysis.")
         return
+    reuse_calibration_ui()
     S = load_settings(rid)
     _, saved = load_calibration(rid)
     saved_in = (saved or {}).get("input", {})
@@ -542,11 +654,13 @@ def page_calibrate():
     chk = st.session_state.setdefault(chk_key, [])
     roi_key = f"roi_{rid}"
     roi_pts = st.session_state.setdefault(roi_key, [list(p) for p in load_roi(rid)])
-    targets = ["cal"] + (["chk"] if saved is not None else []) + ["roi"]
+    zone_draft = st.session_state.setdefault(f"zone_draft_{rid}", [])
+    targets = ["cal"] + (["chk"] if saved is not None else []) + ["roi", "zone"]
     target = st.radio("Clicks on the image add", targets, horizontal=True, key=f"target_{rid}",
                       format_func=lambda t: {"cal": "Calibration points (yellow)",
                                              "chk": "Accuracy-check points (pink)",
-                                             "roi": "Road area outline (green, optional)"}[t])
+                                             "roi": "Road area outline (green, optional)",
+                                             "zone": "Named zone outline (white, optional)"}[t])
 
     c1, c2 = st.columns([3, 2])
     with c2:
@@ -565,6 +679,14 @@ def page_calibrate():
     draw_points(shown, pts, scale, (0, 220, 255), closed=len(pts) == 4)
     draw_points(shown, chk, scale, (200, 80, 255), closed=False)
     draw_points(shown, roi_pts, scale, (80, 220, 80), closed=len(roi_pts) >= 3)
+    for i, z in enumerate(load_zones(rid)):
+        col = ZONE_COLORS[i % len(ZONE_COLORS)]
+        q = (np.asarray(z["points"]) * scale).astype(np.int32)
+        cv2.polylines(shown, [q], True, col, 2, cv2.LINE_AA)
+        c = q.mean(axis=0).astype(int)
+        cv2.putText(shown, z["name"], (int(c[0]) - 4 * len(z["name"]), int(c[1])), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    col, 2, cv2.LINE_AA)
+    draw_points(shown, zone_draft, scale, (255, 255, 255), closed=len(zone_draft) >= 3)
     with c1:
         try:
             from streamlit_image_coordinates import streamlit_image_coordinates
@@ -581,6 +703,8 @@ def page_calibrate():
             st.session_state[chk_key] = (chk + [p])[-2:]
         elif target == "roi":
             roi_pts.append(p)
+        elif target == "zone":
+            zone_draft.append(p)
         elif len(pts) < n_pts:
             pts.append(p)
         st.rerun()
@@ -610,25 +734,26 @@ def page_calibrate():
             edited = point_editor(pts, n_pts, f"ed_{rid}_{method}")
             if edited != pts:
                 st.session_state[key] = pts = edited
-        saved_roi = load_roi(rid)
-        with st.expander(f"Road area: {'saved, ' if saved_roi else ''}{len(roi_pts)} points",
-                         expanded=target == "roi"):
-            st.caption("Optional. Choose *Road area outline* above and click around the roadway and crosswalks. "
-                       "Road users outside it (parked cars in a lot, people on the sidewalk) are ignored, so they "
-                       "cannot cause false alarms. Leave it empty to use the whole frame.")
-            a, b, c = st.columns(3)
-            if a.button("Save area", disabled=len(roi_pts) < 3 or roi_pts == saved_roi, type="primary"):
-                write_json(run_dir(rid) / "roi.json", {"points": roi_pts})
-                st.rerun()
-            if b.button("Undo point", disabled=not roi_pts):
-                roi_pts.pop()
-                st.rerun()
-            if c.button("Clear area", disabled=not roi_pts and not saved_roi):
-                roi_pts.clear()
-                (run_dir(rid) / "roi.json").unlink(missing_ok=True)
-                st.rerun()
-            if roi_pts != saved_roi:
-                st.caption("Not saved yet.")
+    saved_roi = load_roi(rid)
+    with st.expander(f"Road area: {'saved, ' if saved_roi else ''}{len(roi_pts)} points", expanded=target == "roi",
+                     icon=":material/road:"):
+        st.caption("Optional. Choose *Road area outline* above and click around the roadway and crosswalks. "
+                   "Road users outside it (parked cars in a lot, people on the sidewalk) are ignored, so they "
+                   "cannot cause false alarms. Leave it empty to use the whole frame.")
+        a, b, c = st.columns(3)
+        if a.button("Save area", disabled=len(roi_pts) < 3 or roi_pts == saved_roi, type="primary", width="stretch"):
+            write_json(run_dir(rid) / "roi.json", {"points": roi_pts})
+            st.rerun()
+        if b.button("Undo point", disabled=not roi_pts, width="stretch"):
+            roi_pts.pop()
+            st.rerun()
+        if c.button("Clear area", disabled=not roi_pts and not saved_roi, width="stretch"):
+            roi_pts.clear()
+            (run_dir(rid) / "roi.json").unlink(missing_ok=True)
+            st.rerun()
+        if roi_pts != saved_roi:
+            st.caption("Not saved yet.")
+    zones_editor(zone_draft, target == "zone")
 
     cal, d = load_calibration(rid)
     if cal is None:
@@ -682,7 +807,8 @@ def page_calibrate():
 
 # ================================================================== RESULTS
 def thresholds_ui(S: Settings) -> None:
-    with st.expander("Thresholds (change what gets flagged)"):
+    with st.container(border=True):
+        st.subheader("Thresholds", anchor=False)
         st.caption("Defaults are starting points for screening, not safety standards. Validate them on your own clips.")
         a, b, c = st.columns(3)
         S.ttc_candidate_s = a.slider("Candidate if TTC under (s)", 1.0, 6.0, S.ttc_candidate_s, 0.5)
@@ -707,7 +833,7 @@ def thresholds_ui(S: Settings) -> None:
 
 
 def page_results():
-    st.header("3. Results")
+    page_header("Results", "Results", "What was flagged, where, and how it compares with the amount of traffic.")
     if need_run():
         return
     a = get_analysis(rid)
@@ -717,60 +843,136 @@ def page_results():
         return
     cal, S, det, tracks, stats, events = a
     sev = pd.Series([e["severity"] for e in events]).value_counts() if events else pd.Series(dtype=int)
-    c = st.columns(5)
-    c[0].metric("Tracked road users", stats["analysed_tracks"])
-    c[1].metric("Flagged events", len(events))
-    c[2].metric("Serious", int(sev.get("serious", 0)))
-    c[3].metric("Moderate", int(sev.get("moderate", 0)))
-    c[4].metric("Candidate", int(sev.get("candidate", 0)))
     rate = lambda v: "n/a" if v is None else str(v)
-    c = st.columns(4)
-    c[0].metric("Vehicles", stats["road_users"].get("veh", 0))
+    c = st.columns(3)
+    c[0].metric("Flagged events", len(events))
     c[1].metric("Events per 100 vehicles", rate(stats["events_per_100_vehicles"]),
                 help="Raw counts grow with traffic. Rates let you compare a busy clip with a quiet one.")
-    c[2].metric("Events per 1,000 pairs", rate(stats["events_per_1000_pairs"]),
-                help="Pairs = two road users (of a kind the engine checks) on the road at the same time.")
-    c[3].metric("Events per hour", rate(stats["events_per_hour"]))
-    per_kind = stats["events_per_1000_pairs_by_kind"]
-    st.caption("Per 1,000 pairs on the road together: " + ", ".join(
-        f"{KIND_LABEL[k].lower()} {rate(per_kind[k])} ({stats['pairs_together'][k]} pair"
-        f"{'' if stats['pairs_together'][k] == 1 else 's'})" for k in per_kind)
-        + f". Road users: {stats['road_users'].get('ped', 0)} pedestrians, {stats['road_users'].get('bike', 0)} "
-          f"bicycles, {stats['road_users'].get('veh', 0)} vehicles.")
-    roi_note = (f"{stats['dropped_outside_roi']} outside the road area, " if load_roi(rid) else "")
-    st.caption(f"Tracks left out: {roi_note}{stats['dropped_riders']} riders (person on a bike counted once), "
-               f"{stats['dropped_short']} too short (mostly flicker or duplicate boxes), {stats['dropped_out_of_range']} out of range. "
-               f"Flags filtered out as likely false alarms: {stats.get('filtered_duplicate_detection', 0)} one road user "
-               f"detected twice, {stats.get('filtered_ttc_too_brief', 0)} too brief, "
-               f"{stats.get('filtered_no_evasive_action', 0)} driving past a stopped road user without braking.")
+    c[2].metric("Road users tracked", stats["analysed_tracks"])
+    c = st.columns(3)
+    c[0].metric("Serious", int(sev.get("serious", 0)))
+    c[1].metric("Moderate", int(sev.get("moderate", 0)))
+    c[2].metric("Candidate", int(sev.get("candidate", 0)))
     if blind_spot(meta):
         st.warning(blind_spot(meta))
-    thresholds_ui(Settings.from_dict(S.to_dict()))
-    l, r = st.columns([3, 2])
-    with l:
-        heat = st.checkbox("Heat layer", True)
-        st.image(rgb(topdown_map(tracks, events, cal, heat=heat)),
-                 caption="Top-down map. Thin lines are paths (green pedestrians, purple bikes, blue vehicles). "
-                         "Dots are flagged events.", width="stretch")
-    with r:
-        if events:
-            df = pd.DataFrame(events_table(events))
-            df["label"] = df["label"].map(lambda v: LABEL_TEXT.get(v, ""))
-            st.dataframe(df.drop(columns=["why"]), hide_index=True, width="stretch")
-            st.download_button("Download events.csv", df.to_csv(index=False), "events.csv", "text/csv")
-            ids = [e["id"] for e in events]
-            pick = st.selectbox("Look at an event", range(len(ids)), format_func=lambda i: ids[i])
-            st.button("Open it in Event Review ->", type="primary", on_click=go,
-                      args=("Event Review",), kwargs={f"ev_{rid}": pick})
-        else:
-            st.success("No events flagged with these thresholds. Try loosening them, or check the calibration.")
-    speed_ui(S, tracks)
-    sensitivity_ui(S, tracks)
-    export_ui(S, stats, tracks, events)
+    tabs = st.tabs([":material/map: Map & events", ":material/insights: Traffic & rates", ":material/pin_drop: Zones",
+                    ":material/speed: Speeds", ":material/tune: Thresholds", ":material/slow_motion_video: Slow-motion video",
+                    ":material/download: Export"])
+    with tabs[0]:
+        l, r = st.columns([3, 2])
+        with l:
+            heat = st.toggle("Heat layer", True)
+            st.image(rgb(topdown_map(tracks, events, cal, heat=heat, zones=zone_overlays(cal))),
+                     caption="Top-down map. Thin lines are paths (green pedestrians, purple bikes, blue vehicles). "
+                             "Dots are flagged events; shaded areas are named zones.", width="stretch")
+        with r:
+            if events:
+                df = pd.DataFrame(events_table(events))
+                df["label"] = df["label"].map(lambda v: LABEL_TEXT.get(v, ""))
+                if not load_zones(rid):
+                    df = df.drop(columns=["zone"])
+                st.dataframe(df.drop(columns=["why"]).style.format(precision=2, na_rep="").map(
+                    lambda v: f"color: {SEV_HEX[v]}; font-weight: 600" if v in SEV_HEX else "", subset=["severity"]),
+                    hide_index=True, width="stretch")
+                ids = [e["id"] for e in events]
+                pick = st.selectbox("Look at an event", range(len(ids)), format_func=lambda i: event_name(events[i]))
+                st.button("Open it in Event Review", type="primary", icon=":material/arrow_forward:", on_click=go,
+                          args=("Event Review",), kwargs={f"ev_{rid}": pick})
+            else:
+                st.success("No events flagged with these thresholds. Try loosening them, or check the calibration.")
+    with tabs[1]:
+        c = st.columns(4)
+        c[0].metric("Vehicles", stats["road_users"].get("veh", 0))
+        c[1].metric("Pedestrians", stats["road_users"].get("ped", 0))
+        c[2].metric("Events per 1,000 pairs", rate(stats["events_per_1000_pairs"]),
+                    help="Pairs = two road users (of a kind the engine checks) on the road at the same time.")
+        c[3].metric("Events per hour", rate(stats["events_per_hour"]))
+        per_kind = stats["events_per_1000_pairs_by_kind"]
+        st.dataframe(pd.DataFrame([{"type": KIND_LABEL[k], "pairs on the road together": stats["pairs_together"][k],
+                                    "events": sum(e["kind"] == k for e in events),
+                                    "events per 1,000 pairs": rate(per_kind[k])} for k in per_kind]),
+                     hide_index=True, width="stretch")
+        roi_note = (f"{stats['dropped_outside_roi']} outside the road area, " if load_roi(rid) else "")
+        st.caption(f"Tracks left out: {roi_note}{stats['dropped_riders']} riders (person on a bike counted once), "
+                   f"{stats['dropped_short']} too short (mostly flicker or duplicate boxes), "
+                   f"{stats['dropped_out_of_range']} out of range. Flags filtered out as likely false alarms: "
+                   f"{stats.get('filtered_duplicate_detection', 0)} one road user detected twice, "
+                   f"{stats.get('filtered_ttc_too_brief', 0)} too brief, {stats.get('filtered_no_evasive_action', 0)} "
+                   "driving past a stopped road user without braking.")
+    with tabs[2]:
+        zones_ui(cal, tracks, events)
+    with tabs[3]:
+        speed_ui(S, tracks)
+    with tabs[4]:
+        thresholds_ui(Settings.from_dict(S.to_dict()))
+        sensitivity_ui(S, tracks)
+    with tabs[5]:
+        slowmo_ui(S, events)
+    with tabs[6]:
+        export_ui(S, stats, tracks, events)
+
+
+def zones_ui(cal, tracks, events) -> None:
+    zones = load_zones(rid)
+    if not zones:
+        st.info("No zones yet. On **Calibrate**, choose *Named zone outline*, click around a crosswalk or bike lane, "
+                "and name it. Each event is then tagged with its zone.")
+        st.button("Go to Calibrate", on_click=go, args=("Calibrate",))
+        return
+    rows = zone_summary(events, tracks, zones, cal)
+    df = pd.DataFrame(rows).rename(columns={"events_per_100_users": "events per 100 road users"})
+    st.dataframe(df.drop(columns=["valid"]), hide_index=True, width="stretch")
+    if not all(r["valid"] for r in rows):
+        st.warning("Some zones reach above the horizon of the calibration and cannot be measured: "
+                   + ", ".join(r["zone"] for r in rows if not r["valid"]) + ". Redraw them on the road surface.")
+    outside = sum(1 for e in events if not e.get("zone"))
+    st.caption(f"{outside} event(s) are outside every zone. Road users through a zone are counted once each, even if "
+               "they pass through it twice. A busy zone has more events simply because more people use it: compare "
+               "*events per 100 road users*.")
+    st.download_button("Download zones.csv", df.to_csv(index=False), f"zones_{rid}.csv", "text/csv")
+
+
+def slowmo_ui(S: Settings, events) -> None:
+    st.write("Make a version of the blurred result video that **slows down around every flagged event**, so a "
+             "viewer can see what happened. A coloured border and banner mark the slowed part.")
+    ann = run_dir(rid) / "annotated.mp4"
+    if not ann.exists():
+        st.info("This recording has no annotated video.")
+        return
+    if not events:
+        st.info("No events are flagged, so there is nothing to slow down.")
+        return
+    a, b, c, d = st.columns(4)
+    factor = a.select_slider("Slow down by", [2, 3, 4, 6, 8], value=4, format_func=lambda f: f"{f}x")
+    before = b.number_input("Start before the event (s)", 0.0, 10.0, 2.0, 0.5)
+    after = c.number_input("Keep slow after (s)", 0.0, 10.0, 1.0, 0.5)
+    only = d.toggle("Highlights only", help="Only the slowed parts, one after another.")
+    sevs = st.multiselect("Events to include", [s for s in ("serious", "moderate", "candidate")
+                                                if any(e["severity"] == s for e in events)],
+                          default=[s for s in ("serious", "moderate", "candidate") if any(e["severity"] == s for e in events)],
+                          format_func=str.capitalize)
+    chosen = [e for e in events if e["severity"] in sevs]
+    out = run_dir(rid) / f"slowmo_{factor}x_{'hl' if only else 'full'}.mp4"
+    if st.button(f"Make slow-motion video ({len(chosen)} events)", type="primary", disabled=not chosen,
+                 icon=":material/slow_motion_video:"):
+        bar = st.progress(0.0, text="Writing video...")
+        info = make_slowmo(str(ann), str(out), chosen, factor, before, after, only,
+                           lambda f: bar.progress(f, text=f"Writing video... {f:.0%}"))
+        bar.empty()
+        st.session_state[f"slowmo_{rid}"] = (str(out), info)
+    made = st.session_state.get(f"slowmo_{rid}")
+    if made and Path(made[0]).exists():
+        path, info = made
+        st.success(f"{info['events']} event(s) in {info['windows']} slowed section(s), {info['seconds']} s long.")
+        st.video(path)
+        st.download_button("Download video", Path(path).read_bytes(), Path(path).name, "video/mp4",
+                           icon=":material/download:")
+        if info["codec"] != "h264":
+            st.caption("ffmpeg was not found, so some browsers cannot play this file. Open it in VLC.")
 
 
 def speed_ui(S: Settings, tracks) -> None:
-    with st.expander("Vehicle speeds"):
+    with st.container():
         info = recording_info(rid)
         limit = st.number_input("Posted speed limit (mph, optional)", 0, 80, int(info.get("posted_limit_mph", 0)), 5,
                                 help="Leave at 0 if you do not know it.")
@@ -808,7 +1010,8 @@ def cached_sensitivity(rid: str, csv_mtime: float, cal_json: str, settings_json:
 
 
 def sensitivity_ui(S: Settings, tracks) -> None:
-    with st.expander("Sensitivity: how the count depends on the thresholds"):
+    with st.container(border=True):
+        st.subheader("Sensitivity: how the count depends on the thresholds", anchor=False)
         st.caption("The thresholds are tunable starting points, not magic numbers. This re-runs the check with one "
                    "threshold changed at a time, so you can see how much the event count depends on it.")
         if not st.toggle("Run it", key=f"sens_{rid}"):
@@ -841,20 +1044,22 @@ def tracks_csv(tracks) -> str:
 
 
 def export_ui(S: Settings, stats: dict, tracks, events) -> None:
-    with st.expander("Export this run (events, tracks, settings, labels)"):
+    with st.container():
         st.caption("Everything needed to check the numbers or reproduce the run. The bundle holds no video frames.")
         _, cd = load_calibration(rid)
         bundle = {"recording": {k: v for k, v in meta.items()}, "calibration": cd, "road_area": load_roi(rid),
-                  "settings": S.to_dict(), "stats": stats, "events": events,
+                  "zones": load_zones(rid), "settings": S.to_dict(), "stats": stats, "events": events,
                   "labels": read_json(run_dir(rid) / "labels.json", {}), "recording_info": recording_info(rid),
                   "speeds": speed_summary(tracks, S), "other_reviewers": [
                       read_json(p, {}) for p in sorted(run_dir(rid).glob("review_*.json"))]}
-        a, b, c = st.columns(3)
+        a, b, c, d = st.columns(4)
         a.download_button("run.json (everything)", json.dumps(bundle, indent=1, default=str),
-                          f"nearmiss_{rid}.json", "application/json")
-        b.download_button("tracks.csv", tracks_csv(tracks), f"tracks_{rid}.csv", "text/csv")
-        c.download_button("labels.json", json.dumps(bundle["labels"], indent=1), f"labels_{rid}.json",
-                          "application/json")
+                          f"nearmiss_{rid}.json", "application/json", icon=":material/download:")
+        b.download_button("events.csv", pd.DataFrame(events_table(events)).to_csv(index=False), f"events_{rid}.csv",
+                          "text/csv", icon=":material/download:")
+        c.download_button("tracks.csv", tracks_csv(tracks), f"tracks_{rid}.csv", "text/csv", icon=":material/download:")
+        d.download_button("labels.json", json.dumps(bundle["labels"], indent=1), f"labels_{rid}.json",
+                          "application/json", icon=":material/download:")
         up = st.file_uploader("Import labels.json (restores Event Review labels, e.g. from another computer)",
                               type=["json"], key=f"lab_up_{rid}")
         if up is not None and st.button("Replace this recording's labels with the file"):
@@ -905,16 +1110,25 @@ def label_event(ev: dict, lab: str, key: str, go_to: int) -> None:
 
 def review_filters(events: list) -> list:
     """Narrow the review list by type, severity and review status."""
-    with st.expander("Filter events"):
-        a, b, c = st.columns(3)
+    with st.expander("Filter events", icon=":material/filter_list:"):
+        a, b, c, d = st.columns(4)
         kinds = a.multiselect("Type", sorted({e["kind"] for e in events}), format_func=KIND_LABEL.get,
                               key=f"f_kind_{rid}")
         sevs = b.multiselect("Severity", [s for s in SEVERITY_LEVELS if any(e["severity"] == s for e in events)],
                              key=f"f_sev_{rid}")
         status = c.selectbox("Status", ["all", "not reviewed", "real", "false alarm", "unsure"], key=f"f_stat_{rid}")
+        zone_names = sorted({e.get("zone", "") for e in events})
+        zones = d.multiselect("Zone", zone_names, format_func=lambda z: z or "(outside every zone)",
+                              key=f"f_zone_{rid}", disabled=zone_names == [""])
         want = {"not reviewed": None, "real": "tp", "false alarm": "fp", "unsure": "unsure"}
         return [e for e in events if (not kinds or e["kind"] in kinds) and (not sevs or e["severity"] in sevs)
-                and (status == "all" or e.get("label") == want[status])]
+                and (status == "all" or e.get("label") == want[status]) and (not zones or e.get("zone", "") in zones)]
+
+
+def next_unreviewed(key: str, events: list, idx: int) -> None:
+    """Button callback: jump to the next event without a label, wrapping around."""
+    order = list(range(idx + 1, len(events))) + list(range(0, idx + 1))
+    st.session_state[key] = next((i for i in order if not events[i].get("label")), idx)
 
 
 def event_name(e: dict) -> str:
@@ -923,7 +1137,7 @@ def event_name(e: dict) -> str:
 
 
 def page_review():
-    st.header("4. Review each flag yourself")
+    page_header("Event Review", "Event review", "Watch each flagged moment and decide whether it was a real near miss.")
     if need_run():
         return
     a = get_analysis(rid)
@@ -939,11 +1153,14 @@ def page_review():
     key = f"ev_{rid}"
     if st.session_state.get(key, 0) >= len(events):
         st.session_state[key] = 0
-    n1, n2, n3 = st.columns([1, 1, 6])
-    n1.button("< Previous", on_click=step_event, args=(key, -1, len(events)), disabled=st.session_state.get(key, 0) == 0)
-    n2.button("Next >", on_click=step_event, args=(key, 1, len(events)),
-              disabled=st.session_state.get(key, 0) == len(events) - 1)
-    idx = n3.selectbox("Event", range(len(events)), key=key, format_func=lambda i: event_name(events[i]),
+    cur = st.session_state.get(key, 0)
+    n1, n2, n3, n4 = st.columns([1, 1, 1.4, 5])
+    n1.button("< Previous", on_click=step_event, args=(key, -1, len(events)), disabled=cur == 0, width="stretch")
+    n2.button("Next >", on_click=step_event, args=(key, 1, len(events)), disabled=cur == len(events) - 1,
+              width="stretch")
+    n3.button("Next unreviewed", on_click=next_unreviewed, args=(key, events, cur), icon=":material/skip_next:",
+              disabled=all(e.get("label") for e in events), width="stretch")
+    idx = n4.selectbox("Event", range(len(events)), key=key, format_func=lambda i: event_name(events[i]),
                        label_visibility="collapsed")
     ev = events[idx]
     reviewed = sum(1 for e in all_events if e.get("label"))
@@ -973,14 +1190,15 @@ def page_review():
         if clip.exists():
             st.video(str(clip))
     with c2:
-        st.metric("Severity", ev["severity"].capitalize())
+        st.markdown(f"{badge(ev['severity'])} &nbsp; **{ev['id']} · {ev['kind_label']}** · t = {ev['t_peak']} s"
+                    + (f" · zone: {html_escape(ev['zone'])}" if ev.get("zone") else ""), unsafe_allow_html=True)
         m = st.columns(3)
         m[0].metric("Closest", f"{ev['d_min_m']} m", help="Centre-to-centre distance at the closest moment.")
         m[1].metric("Min TTC", f"{ev['ttc_min_s']} s" if ev["ttc_min_s"] is not None else "n/a",
                     help="Time to collision: seconds until they would touch if both kept going straight at the same speed.")
         m[2].metric("PET", f"{ev['pet_s']} s" if ev["pet_s"] is not None else "n/a",
                     help="Post-encroachment time: gap between the first leaving and the second reaching the crossing point.")
-        st.write(f"**{ev['kind_label']}.** {explain_event(ev)}")
+        st.write(explain_event(ev))
         if ev.get("below_3ft"):
             st.warning("Estimated clearance is under 3 ft (0.91 m), the California passing rule for bikes.")
         st.caption("Why it was flagged: " + "; ".join(ev["reasons"]))
@@ -1034,7 +1252,7 @@ AI_TEXT = """Fill this in honestly before you submit. Example structure:
 
 
 def page_report():
-    st.header("5. Report")
+    page_header("Report", "Report", "How good the flags were, a second opinion, and a shareable report.")
     if need_run():
         return
     a = get_analysis(rid)
@@ -1044,54 +1262,72 @@ def page_report():
     cal, S, det, tracks, stats, events = a
     store = read_json(run_dir(rid) / "labels.json", {})
     summ = validation.summarize(events, store)
-    st.subheader("Validation of the flags")
-    c = st.columns(6)
+    c = st.columns(3)
+    c[0].metric("Precision", "n/a" if summ["precision"] is None else f"{summ['precision']:.0%}")
+    c[1].metric("Recall (at most)", "n/a" if summ["recall_upper_bound"] is None else f"{summ['recall_upper_bound']:.0%}")
+    c[2].metric("Not reviewed", summ["unreviewed"])
+    c = st.columns(3)
     c[0].metric("Flagged", summ["events_flagged"])
     c[1].metric("Real", summ["tp"])
     c[2].metric("False alarms", summ["fp"])
-    c[3].metric("Not reviewed", summ["unreviewed"])
-    c[4].metric("Precision", "n/a" if summ["precision"] is None else f"{summ['precision']:.0%}")
-    c[5].metric("Recall (at most)", "n/a" if summ["recall_upper_bound"] is None else f"{summ['recall_upper_bound']:.0%}")
-    st.caption("Precision = real / (real + false alarms). Recall can only be bounded from above, because the app cannot "
-               "know about events nobody marked as missed.")
     if summ["unreviewed"]:
         st.warning(f"{summ['unreviewed']} of {summ['events_flagged']} flagged events are not reviewed yet, so the "
                    "precision above describes only the ones you looked at.")
-        st.button(f"Review the {summ['unreviewed']} remaining event(s) first", on_click=go, args=("Event Review",))
-    if summ["by_kind"]:
-        st.write("**By type of conflict**")
-        st.dataframe(pd.DataFrame([
-            {"type": KIND_LABEL[k], "flagged": v["flagged"], "real": v["tp"], "false alarms": v["fp"],
-             "unsure": v["unsure"], "not reviewed": v["unreviewed"],
-             "precision": "n/a" if v["precision"] is None else f"{v['precision']:.0%}"}
-            for k, v in summ["by_kind"].items()]), hide_index=True, width="stretch")
+        st.button(f"Review the {summ['unreviewed']} remaining event(s) first", on_click=go, args=("Event Review",),
+                  icon=":material/fact_check:")
     if blind_spot(meta):
         st.warning(blind_spot(meta))
-    with st.expander("All numbers"):
-        st.json(summ)
-    tuning_ui(S, events)
-    second_review_ui(det, S, events, store)
-    metadata_ui()
-    privacy_ui()
+    tabs = st.tabs([":material/verified: Validation", ":material/tune: Tuning", ":material/group: Second reviewer",
+                    ":material/edit_note: Recording details", ":material/shield: Privacy",
+                    ":material/description: Build report"])
+    with tabs[0]:
+        st.caption("Precision = real / (real + false alarms). Recall can only be bounded from above, because the app "
+                   "cannot know about events nobody marked as missed.")
+        if summ["by_kind"]:
+            st.write("**By type of conflict**")
+            st.dataframe(pd.DataFrame([
+                {"type": KIND_LABEL[k], "flagged": v["flagged"], "real": v["tp"], "false alarms": v["fp"],
+                 "unsure": v["unsure"], "not reviewed": v["unreviewed"],
+                 "precision": "n/a" if v["precision"] is None else f"{v['precision']:.0%}"}
+                for k, v in summ["by_kind"].items()]), hide_index=True, width="stretch")
+        with st.expander("All numbers"):
+            st.json(summ)
+    with tabs[1]:
+        tuning_ui(S, events)
+    with tabs[2]:
+        second_review_ui(det, S, events, store)
+    with tabs[3]:
+        metadata_ui()
+    with tabs[4]:
+        privacy_ui()
+    with tabs[5]:
+        build_report_ui(cal, S, det, tracks, stats, events, summ)
+
+
+def build_report_ui(cal, S, det, tracks, stats, events, summ) -> None:
     _, cd = load_calibration(rid)
     disclosure = st.text_area("AI-use disclosure (the Congressional App Challenge requires it)", AI_TEXT, height=200)
-    if st.button("Build report", type="primary"):
+    if st.button("Build report", type="primary", icon=":material/description:"):
         frames = event_frames(det, S, events[:30])
         page = build_report_html(meta.get("name", rid), {k: v for k, v in meta.items() if k != "settings"},
                                  {k: cd[k] for k in ("width_m", "length_m", "input", "checks") if k in cd}, S, events, summ,
-                                 disclosure, png_b64(topdown_map(tracks, events, cal)), frames,
+                                 disclosure, png_b64(topdown_map(tracks, events, cal, zones=zone_overlays(cal))),
+                                 frames,
                                  notes=[n.replace("**", "") for n in [blind_spot(meta)] if n],
                                  exposure={k: stats[k] for k in ("road_users", "pairs_together", "events_per_100_vehicles",
                                                                  "events_per_1000_pairs",
                                                                  "events_per_1000_pairs_by_kind", "events_per_hour")},
                                  info=recording_info(rid), explain=explain_event,
                                  speeds=speed_summary(tracks, S, (recording_info(rid).get("posted_limit_mph") or 0)
-                                                      / MPS_TO_MPH or None))
+                                                      / MPS_TO_MPH or None),
+                                 zone_rows=zone_summary(events, tracks, load_zones(rid), cal) if load_zones(rid) else None)
         st.session_state[f"report_{rid}"] = page
     if f"report_{rid}" in st.session_state:
-        st.download_button("Download report.html (print to PDF)", st.session_state[f"report_{rid}"],
-                           "nearmiss_report.html", "text/html")
-        st.download_button("Download events.json", json.dumps(events, indent=1, default=str), "events.json")
+        a, b = st.columns(2)
+        a.download_button("Download report.html (print to PDF)", st.session_state[f"report_{rid}"],
+                          "nearmiss_report.html", "text/html", icon=":material/download:")
+        b.download_button("Download events.json", json.dumps(events, indent=1, default=str), "events.json",
+                          icon=":material/download:")
 
 
 def event_frames(det, S: Settings, events) -> dict:
@@ -1102,7 +1338,7 @@ def event_frames(det, S: Settings, events) -> dict:
 
 
 def tuning_ui(S: Settings, events) -> None:
-    with st.expander("Threshold tuning from your labels"):
+    with st.container():
         t = tuning_curve(events, S)
         st.caption(t["caveat"])
         if not t["labelled"]:
@@ -1131,7 +1367,7 @@ def tuning_ui(S: Settings, events) -> None:
 
 
 def second_review_ui(det, S: Settings, events, store: dict) -> None:
-    with st.expander("Second reviewer (review pack and agreement)"):
+    with st.container():
         st.caption("Export a single HTML page someone else can open in any browser to label the events, without "
                    "installing anything. Your own labels are left out so their review is independent. They send back "
                    "a small JSON file; load it here to see how often you agree.")
@@ -1181,7 +1417,7 @@ INFO_FIELDS = [("date", "Date recorded"), ("time", "Time of day"), ("location", 
 
 
 def metadata_ui() -> None:
-    with st.expander("Recording details (date, place, weather, camera)"):
+    with st.container():
         st.caption("Saved with the recording and printed in the report, so old results stay interpretable.")
         info = recording_info(rid)
         with st.form(f"info_{rid}"):
@@ -1200,7 +1436,7 @@ def metadata_ui() -> None:
 
 
 def privacy_ui() -> None:
-    with st.expander("Privacy: files stored for this recording"):
+    with st.container():
         st.caption("Everything below is on this computer only. The original video is the only file with unblurred "
                    "faces and plates.")
         rows = []
@@ -1209,7 +1445,9 @@ def privacy_ui() -> None:
                     "detections.csv": "boxes per frame (no images)", "labels.json": "your labels",
                     "calibration.json": "calibration", "roi.json": "road area", "settings.json": "thresholds",
                     "motion.json": "camera motion", "meta.json": "recording facts",
-                    "recording_info.json": "recording details"}.get(p.name)
+                    "recording_info.json": "recording details", "zones.json": "named zones"}.get(p.name)
+            if what is None and p.name.startswith("slowmo_"):
+                what = "slow-motion video (blurred)"
             if what is None:
                 what = "event clip (blurred)" if p.name.startswith("clip_") else (
                     "second reviewer's answers" if p.name.startswith("review_") else "other")
@@ -1227,7 +1465,7 @@ def privacy_ui() -> None:
 
 # ================================================================== METHOD
 def page_method():
-    st.header("Method and limits")
+    page_header("Method", "Method and limits")
     st.markdown("""
 **Pipeline.** For street-level cameras a pretrained YOLOv8 model (COCO) finds people, bicycles, motorcycles, cars,
 buses and trucks. For drone footage a pretrained aerial model (YOLO11-OBB, trained on the DOTA aerial dataset) finds

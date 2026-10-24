@@ -1,0 +1,11 @@
+[theme]
+# Calm navy accent; Streamlit derives the dark theme from the viewer's system setting.
+primaryColor = "#1f5fbf"
+font = "sans serif"
+baseRadius = "medium"
+
+[server]
+maxUploadSize = 2000   # MB: intersection clips are often bigger than the 200 MB default
+
+[browser]
+gatherUsageStats = false
