@@ -33,7 +33,8 @@ import streamlit as st
 
 from detect_job import load_job, new_job, run_job
 from detector_tracker import (MODEL_CHOICES, VISDRONE_MODEL, RenderOptions, RoadUserTracker, TrackerSettings,
-                              aerial_choices, auto_stride, device_label, finds_people, intel_devices, pick_device)
+                              aerial_choices, auto_stride, device_label, finds_people, intel_devices, pick_device,
+                              render_from_detections)
 from engine import demo, design, review_pack, validation
 from engine.analysis import (analyze, build_report_html, cut_clip, distance_series, event_frame, events_table,
                              load_tracker_csv, topdown_map)
@@ -685,6 +686,13 @@ def page_detect():
                           if d == "auto" else device_label(d),
                           help="auto picks the fastest one found: an NVIDIA GPU, an Apple chip, or an Intel GPU "
                                "(through OpenVINO, about 4x faster than the CPU on an Intel Arc laptop chip).")
+    speed = st.radio("Speed", list(SPEED_MODES), index=1, horizontal=True, key="det_speed",
+                     format_func=lambda k: SPEED_MODES[k]["label"],
+                     help="How many frames per second are analysed, and whether the tracked video of the whole clip "
+                          "is drawn during detection. Event clips are always available: without the tracked video "
+                          "they are drawn when you open them.")
+    st.caption(SPEED_MODES[speed]["note"])
+    analysis_fps, draw_video = SPEED_MODES[speed]["fps"], SPEED_MODES[speed]["video"]
     with st.expander("More settings"):
         a, b, c = st.columns(3)
         high = a.slider("Detection confidence", 0.10, 0.60, 0.25, 0.05,
@@ -694,7 +702,8 @@ def page_detect():
         a, b, c = st.columns(3)
         coast = a.slider("Carry box forward after a miss (s)", 0.0, 2.0, 1.0, 0.25)
         trail = b.slider("Trail length (s)", 0.0, 5.0, 2.0, 0.5)
-        stride_auto = c.checkbox("Auto-skip frames (about 12 fps)", True)
+        stride_auto = c.checkbox("Skip frames as the Speed setting says", True,
+                                 help="Off: analyse every frame of the video (slowest; rarely needed).")
         stabilize = st.checkbox("Camera moves (drone, wind, zoom): line every frame up with the first one", overhead,
                                 help="Without this, a drifting camera makes parked cars look like they are driving "
                                      "and puts every position after the first seconds in the wrong place. "
@@ -723,7 +732,7 @@ def page_detect():
     if not files:
         return
     up, src_tmp, m = files[0]
-    stride = auto_stride(m["fps"]) if stride_auto else 1
+    stride = auto_stride(m["fps"], analysis_fps) if stride_auto else 1
     dev = pick_device(device)
     if len(files) == 1:
         kpis([("Duration", f"{m['duration_s']} s"), ("FPS", m["fps"]), ("Resolution", f"{m['width']}x{m['height']}"),
@@ -739,11 +748,12 @@ def page_detect():
                    "times faster (Intel needs `pip install openvino`).")
 
     def settings_for(mm):
-        st_ = auto_stride(mm["fps"]) if stride_auto else 1
+        st_ = auto_stride(mm["fps"], analysis_fps) if stride_auto else 1
         return (TrackerSettings(model_name=model, imgsz=imgsz, high_conf=high, start_conf=start,
                                 track_buffer_s=buffer_s, stride=st_, device=device, coast_s=coast, trail_s=trail,
                                 stabilize=stabilize),
-                RenderOptions(blur_privacy=blur, privacy_level=level, show_trails=trail > 0, show_confidence=conf_show))
+                RenderOptions(blur_privacy=blur, privacy_level=level, show_trails=trail > 0, show_confidence=conf_show,
+                              enabled=draw_video))
 
     a, b = st.columns([1, 3])
     test = a.button("Try on the first 10 s", icon=":material/science:",
@@ -818,6 +828,21 @@ def compare_models_ui(path: str, m: dict, choices: dict, current: str, imgsz: in
                 col.image(rgb(r["snapshot"]), width="stretch", caption=f"{r['model']} at {secs / 2:.0f} s (blurred)")
             if r["warning"]:
                 col.warning(r["warning"])
+
+
+# Speeds measured on 2 min of a 1280x720 intersection clip, Intel Core Ultra 5 226V on mains power (Arc GPU).
+SPEED_MODES = {
+    "full": {"label": "Full (12 fps + tracked video)", "fps": 12.0, "video": True,
+             "note": "12 frames analysed per second, and the tracked video of the whole clip is drawn while detecting. "
+                     "About 4.5x faster than real time on an Intel Arc laptop GPU."},
+    "fast": {"label": "Fast (12 fps, video later)", "fps": 12.0, "video": False,
+             "note": "The same 12 frames per second, so exactly the same tracks and events, but the whole tracked "
+                     "video is not drawn (event clips are drawn when opened). About 6x faster than real time."},
+    "fastest": {"label": "Fastest (6 fps, video later)", "fps": 6.0, "video": False,
+                "note": "6 frames per second: about 15x faster than real time, but on our test clip it kept 5 "
+                        "pedestrian tracks instead of 13 and 55 cars instead of 80. Good for a first pass over long "
+                        "footage; use Fast for anything you report."},
+}
 
 
 def save_upload(up) -> Path:
@@ -982,6 +1007,9 @@ def after_run_ui(run_id: str, job: dict) -> None:
                    "Run `pip install imageio-ffmpeg`, or open the file in VLC.")
     if (d / "annotated.mp4").exists():
         st.video(str(d / "annotated.mp4"))
+    else:
+        st.caption("Fast mode: no tracked video of the whole clip was drawn. Event clips are drawn when you open them, "
+                   "and Results > Slow-motion video can draw the whole tracked video later.")
     st.download_button("Download detections.csv", (d / "detections.csv").read_bytes(), "detections.csv", "text/csv")
     st.write("Next, calibrate so distances and speeds are in metres.")
     next_button("Calibrate", "Calibrate")
@@ -1734,12 +1762,36 @@ def sensitivity_ui(S: Settings) -> None:
             st.dataframe(df, hide_index=True, width="stretch")
 
 
+def draw_tracked_video_ui() -> None:
+    """Fast-mode recordings have no tracked video; draw it now from the original video and the saved detections."""
+    if not has_source(rid):
+        st.info("This recording has no tracked video, and the original video was deleted, so it cannot be drawn.")
+        return
+    mins = meta.get("duration_s", 0) / 60
+    st.info(f"Detection ran in fast mode, so there is no tracked video of the whole clip yet (event clips are drawn "
+            f"when you open them). Drawing it takes roughly {max(1, round(mins / 6))} min for this "
+            f"{mins:.0f}-min clip.")
+    if st.button("Draw the tracked video now", icon=":material/movie:"):
+        a = get_analysis(rid)
+        det = a[2] if a else load_tracker_csv(run_dir(rid) / "detections.csv")
+        priv = meta.get("privacy") or {}
+        ro = RenderOptions(blur_privacy=priv.get("blur", True),
+                           privacy_level=priv.get("level") if priv.get("level") in ("standard", "strict") else "standard")
+        bar = st.progress(0.0, text="Drawing the tracked video...")
+        tmp = run_dir(rid) / "annotated.partial.mp4"
+        render_from_detections(source_path(rid), det, str(tmp), float(meta["fps"]), int(meta.get("stride", 1)), ro,
+                               0.0, float(meta.get("duration_s", 0)),
+                               progress=lambda f: bar.progress(f, text=f"Drawing the tracked video... {f:.0%}"))
+        tmp.replace(run_dir(rid) / "annotated.mp4")
+        st.rerun()
+
+
 def slowmo_ui(S: Settings, events) -> None:
     st.write("Make a version of the result video that **slows down around every flagged event**. A coloured border and "
              f"banner mark the slowed part. Made from the tracked video, which is **{video_privacy_text(meta)}**.")
     ann = run_dir(rid) / "annotated.mp4"
     if not ann.exists():
-        st.info("This recording has no annotated video.")
+        draw_tracked_video_ui()
         return
     if not events:
         st.info("No events are flagged, so there is nothing to slow down.")
@@ -2000,16 +2052,15 @@ def review_player(det, S, tracks, ev) -> None:
     t0, t1 = ev["t_start"] - S.clip_before_s, ev["t_end"] + S.clip_after_s
     with tabs[0]:
         clip = run_dir(rid) / f"clip_{max(t0, 0):.2f}_{t1:.2f}.mp4"     # by time: event IDs change with thresholds
-        ann = run_dir(rid) / "annotated.mp4"
-        if not clip.exists() and ann.exists():
-            with st.spinner("Cutting the clip..."):
-                cut_clip(str(ann), str(clip), t0, t1)
+        if not clip.exists():
+            with st.spinner("Making the clip..."):
+                event_clip(det, max(t0, 0), t1, clip)
         if clip.exists():
             st.video(str(clip), loop=True)
             st.caption(f"Clip {max(t0, 0):.1f}-{t1:.1f} s, looping. From the tracked video, which is "
                        f"{video_privacy_text(meta)}.")
         else:
-            st.caption("No clip: the tracked video or ffmpeg is missing.")
+            st.caption("No clip: the tracked video and the original video are both missing, or ffmpeg is missing.")
     with tabs[1]:
         if not has_source(rid):
             st.caption("The original video was deleted for privacy, so frames cannot be stepped through.")
@@ -2442,17 +2493,33 @@ def tuning_ui(S: Settings, events) -> None:
 
 def pack_clips(events) -> dict:
     """Small blurred clips for the review pack (base64)."""
-    ann = run_dir(rid) / "annotated.mp4"
     out = {}
-    if not ann.exists():
+    a = get_analysis(rid)
+    if a is None or not ((run_dir(rid) / "annotated.mp4").exists() or has_source(rid)):
         return out
     S = load_settings(rid)
     for e in events:
         t0, t1 = max(0.0, e["t_start"] - S.clip_before_s), e["t_end"] + S.clip_after_s
         path = run_dir(rid) / f"packclip_{t0:.2f}_{t1:.2f}.mp4"
-        if path.exists() or cut_clip(str(ann), str(path), t0, t1, max_width=640):
+        if path.exists() or event_clip(a[2], t0, t1, path, max_width=640):
             out[e["id"]] = base64.b64encode(path.read_bytes()).decode()
     return out
+
+
+def event_clip(det, t0: float, t1: float, out: Path, max_width: Optional[int] = None) -> bool:
+    """A blurred clip of [t0, t1]: cut from the tracked video, or, when detection ran in fast mode without one,
+    drawn now from the original video and the saved detections (same blur, boxes and trails)."""
+    ann = run_dir(rid) / "annotated.mp4"
+    if ann.exists():
+        return cut_clip(str(ann), str(out), t0, t1, max_width=max_width)
+    if not has_source(rid):
+        return False
+    priv = meta.get("privacy") or {}
+    ro = RenderOptions(blur_privacy=priv.get("blur", True),
+                       privacy_level=priv.get("level") if priv.get("level") in ("standard", "strict") else "standard",
+                       max_width=max_width or 1280)
+    return render_from_detections(source_path(rid), det, str(out), float(meta["fps"]), int(meta.get("stride", 1)),
+                                  ro, t0, t1) > 0
 
 
 def second_review_ui(det, S: Settings, events, store: dict) -> None:

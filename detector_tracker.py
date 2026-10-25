@@ -39,6 +39,7 @@ import shutil
 import tempfile
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -155,6 +156,7 @@ class TrackerSettings:
     track_buffer_s: float = 3.0   # how long a lost track is kept alive (seconds)
     match_thresh: float = 0.8     # ByteTrack association threshold
     stride: int = 1               # process every Nth frame (1 = all frames)
+    batch: int = 8                # frames detected per model call (GPUs are much faster with a batch)
     device: str = "auto"          # "auto" | "cpu" | "mps" | "cuda:0"
     coast_s: float = 1.0          # carry a box forward this long after a missed detection
     trail_s: float = 2.0          # length of the motion trail
@@ -173,6 +175,7 @@ class RenderOptions:
     show_coasting: bool = True
     show_confidence: bool = False
     max_width: int = 1280         # annotated frames are scaled down to this width (smaller, faster files)
+    enabled: bool = True          # False: no tracked video during detection (fastest); event clips are drawn later
 
 
 def auto_stride(fps: float, target_fps: float = 12.0) -> int:
@@ -442,20 +445,21 @@ def input_shape(imgsz: int, frame_wh: Optional[Tuple[int, int]] = None) -> Tuple
     return (imgsz, pad(w)) if h >= w else (pad(h), imgsz)
 
 
-def openvino_dir(name: str, shape: Tuple[int, int]) -> Path:
-    """Where the OpenVINO copy of a model is cached (one per input shape, since an exported model's shape is fixed)."""
-    return HERE / "openvino_cache" / f"{Path(name).stem}_{shape[0]}x{shape[1]}_openvino_model"   # suffix needed
+def openvino_dir(name: str, shape: Tuple[int, int], batch: int = 1) -> Path:
+    """Where the OpenVINO copy of a model is cached (one per input shape and batch: an export's shape is fixed)."""
+    return HERE / "openvino_cache" / f"{Path(name).stem}_{shape[0]}x{shape[1]}_b{batch}_openvino_model"  # suffix needed
 
 
-def _load_openvino(name: str, shape: Tuple[int, int]):
-    """The OpenVINO version of `name` for this input shape, exported on first use (a few seconds) and cached.
-    FP16 weights: as accurate as FP32 here and a little faster on Intel GPUs and NPUs."""
+def _load_openvino(name: str, shape: Tuple[int, int], batch: int = 1):
+    """The OpenVINO version of `name` for this input shape and batch size, exported on first use (a few seconds)
+    and cached. FP16 weights: as accurate as FP32 here and a little faster on Intel GPUs and NPUs."""
     from ultralytics import YOLO
 
-    target = openvino_dir(name, shape)
+    target = openvino_dir(name, shape, batch)
     if not (target / "metadata.yaml").exists():
         torch_model, used, _ = _load_model(name)
-        exported = Path(torch_model.export(format="openvino", imgsz=list(shape), half=True, verbose=False))
+        exported = Path(torch_model.export(format="openvino", imgsz=list(shape), half=True, batch=batch,
+                                           verbose=False))
         target.parent.mkdir(exist_ok=True)
         if target.exists():
             shutil.rmtree(target)
@@ -465,6 +469,58 @@ def _load_openvino(name: str, shape: Tuple[int, int]):
     # class names straight from the export's metadata: asking the model for .names would first compile it on the CPU
     names = {int(k): v for k, v in yaml.safe_load((target / "metadata.yaml").read_text())["names"].items()}
     return YOLO(str(target), task="obb" if "-obb" in name else "detect"), names
+
+
+class FastOpenVINO:
+    """Batched detection with the image conversion done on the Intel GPU.
+
+    Ultralytics turns every frame into 32-bit floats on the CPU before inference; at 960 px that cost 12 ms per frame,
+    twice the GPU's own 6 ms. Here the frames go to OpenVINO as they are (8-bit BGR, one letterbox per frame), and an
+    OpenVINO pre-processing step converts, reorders the colour channels and scales them on the GPU. Everything after
+    inference (non-max suppression with Ultralytics' defaults, box scaling, Results) is Ultralytics' own code, so the
+    boxes match predict() (tests/test_fast_openvino.py)."""
+
+    def __init__(self, folder: Path, device: str, names: Dict[int, str], task: str, shape: Tuple[int, int],
+                 batch: int):
+        import openvino as ov
+        from ultralytics.data.augment import LetterBox
+
+        core = ov.Core()
+        model = core.read_model(str(next(Path(folder).glob("*.xml"))))
+        ppp = ov.preprocess.PrePostProcessor(model)
+        ppp.input().tensor().set_element_type(ov.Type.u8).set_layout(ov.Layout("NHWC")) \
+            .set_color_format(ov.preprocess.ColorFormat.BGR)
+        ppp.input().preprocess().convert_element_type(ov.Type.f32) \
+            .convert_color(ov.preprocess.ColorFormat.RGB).scale(255.0)
+        ppp.input().model().set_layout(ov.Layout("NCHW"))
+        self.compiled = core.compile_model(ppp.build(), device.split(":", 1)[1].upper(), {"PERFORMANCE_HINT": "LATENCY"})
+        self.request = self.compiled.create_infer_request()
+        self.output = self.compiled.output(0)
+        self.names, self.task, self.shape, self.batch = names, task, tuple(shape), int(batch)
+        self.letterbox = LetterBox(list(shape), auto=False, stride=32)
+
+    def __call__(self, frames: List[np.ndarray], conf: float, classes: List[int]):
+        import torch
+        from ultralytics.engine.results import Results
+        from ultralytics.utils import nms, ops
+
+        n = len(frames)
+        padded = list(frames) + [frames[-1]] * (self.batch - n)       # the model takes exactly `batch` frames
+        imgs = np.stack([self.letterbox(image=f) for f in padded])
+        out = self.request.infer({0: imgs})[self.output]
+        preds = nms.non_max_suppression(torch.from_numpy(np.asarray(out)), conf, 0.7, classes, False, max_det=300,
+                                        nc=0 if self.task == "detect" else len(self.names),
+                                        rotated=self.task == "obb")
+        results = []
+        for pred, orig in zip(preds[:n], frames):
+            if self.task == "obb":
+                rboxes = torch.cat([pred[:, :4], pred[:, -1:]], dim=-1)
+                rboxes[:, :4] = ops.scale_boxes(self.shape, rboxes[:, :4], orig.shape, xywh=True)
+                results.append(Results(orig, path="", names=self.names, obb=torch.cat([rboxes, pred[:, 4:6]], dim=-1)))
+            else:
+                pred[:, :4] = ops.scale_boxes(self.shape, pred[:, :4], orig.shape)
+                results.append(Results(orig, path="", names=self.names, boxes=pred[:, :6]))
+        return results
 
 
 class RoadUserTracker:
@@ -477,6 +533,10 @@ class RoadUserTracker:
         self.device_used = pick_device(self.s.device)
         self.classes = class_map(self.model.names)       # reading names from the PyTorch weights compiles nothing
         self.shape = (self.s.imgsz, self.s.imgsz)
+        self.fast = None
+        self.motion = None
+        self.stats = {"frames": 0, "frames_with_carried_boxes": 0}
+        self.timing = {"model": 0.0, "motion": 0.0, "render": 0.0}   # seconds spent in each stage (tools/benchmark.py)
 
     def _prepare_intel(self, frame_wh: Tuple[int, int]) -> None:
         """Swap in the OpenVINO model once the video's shape is known; on any problem stay on the CPU."""
@@ -484,29 +544,72 @@ class RoadUserTracker:
             return
         self.shape = input_shape(self.s.imgsz, frame_wh)
         try:
-            self.model, names = _load_openvino(self.model_used, self.shape)
+            self.model, names = _load_openvino(self.model_used, self.shape, max(1, int(self.s.batch)))
             self.classes = class_map(names)
+            try:
+                self.fast = FastOpenVINO(openvino_dir(self.model_used, self.shape, max(1, int(self.s.batch))),
+                                         self.device_used, names, "obb" if "-obb" in self.model_used else "detect",
+                                         self.shape, max(1, int(self.s.batch)))
+            except Exception:
+                self.fast = None                     # Ultralytics' own (slower) path still works
         except Exception as ex:
             self.warning = (self.warning + " " if self.warning else "") + \
                 f"The fast {device_label(self.device_used)} model could not be prepared ({type(ex).__name__}); " \
                 "running on the CPU instead."
             self.device_used = "cpu"
             self.shape = (self.s.imgsz, self.s.imgsz)
-        self.motion = None
-        self.stats = {"frames": 0, "frames_with_carried_boxes": 0}
-        self.timing = {"model": 0.0, "motion": 0.0, "render": 0.0}   # seconds spent in each stage (tools/benchmark.py)
 
-    def _track(self, frame: np.ndarray, yaml_path: str):
-        """Detect + track one frame. persist=True keeps ByteTrack's state from the previous call."""
-        imgsz = list(self.shape) if self.device_used.startswith("intel:") else self.s.imgsz
-        return self.model.track(frame, classes=list(self.classes), conf=self.s.detector_conf, imgsz=imgsz,
-                                device=self.device_used, persist=True, tracker=yaml_path, verbose=False)[0]
+    def _detect(self, frames: List[np.ndarray]):
+        """Detect road users on several frames in one call: the GPU is much better used with a batch (on the Intel
+        Arc 130V, 12 ms per frame in batches of 8 against 18 ms one by one). Tracking happens afterwards, in order."""
+        intel = self.device_used.startswith("intel:")
+        if intel and getattr(self, "fast", None) is not None:
+            t0 = time.perf_counter()
+            res = self.fast(frames, self.s.detector_conf, list(self.classes))
+            self.timing["fast_openvino"] = self.timing.get("fast_openvino", 0.0) + time.perf_counter() - t0
+            return res
+        imgsz = list(self.shape) if intel else self.s.imgsz
+        n = len(frames)
+        if intel and n < self.s.batch:                 # the exported model takes exactly `batch` frames: pad the last
+            frames = list(frames) + [frames[-1]] * (self.s.batch - n)
+        res = self.model.predict(frames, classes=list(self.classes), conf=self.s.detector_conf, imgsz=imgsz,
+                                 device=self.device_used, verbose=False)[:n]
+        if res:                                       # Ultralytics' own split, ms per image (tools/benchmark.py)
+            for k in ("preprocess", "inference", "postprocess"):
+                self.timing[k] = self.timing.get(k, 0.0) + res[0].speed.get(k, 0.0) / 1000 * n
+        return res
+
+    def _new_tracker(self, yaml_path: str):
+        """ByteTrack fed one frame at a time with the batch's detections, exactly as Ultralytics' own track() does."""
+        from ultralytics.trackers.byte_tracker import BYTETracker
+        from ultralytics.utils import YAML, IterableSimpleNamespace
+
+        cfg = IterableSimpleNamespace(**YAML.load(yaml_path))
+        try:
+            return BYTETracker(args=cfg, frame_rate=30)     # older Ultralytics versions take frame_rate (30 = no scaling)
+        except TypeError:
+            return BYTETracker(args=cfg)
+
+    @staticmethod
+    def _apply_tracks(result, tracker):
+        """result -> the same result keeping only tracked boxes, with their track IDs (ultralytics/trackers/track.py)."""
+        import torch
+
+        is_obb = result.obb is not None
+        src = result.obb if is_obb else result.boxes
+        tracks = tracker.update(src.cpu().numpy(), result.orig_img)
+        if len(tracks) == 0:
+            return result[:0]
+        out = result[tracks[:, -1].astype(int)]
+        out.update(**{"obb" if is_obb else "boxes": torch.as_tensor(tracks[:, :-1], device=src.data.device)})
+        return out
 
     def process_video(self, video_path: str, fps: float, progress_cb: Optional[Callable[[int, int], None]] = None,
                       start_frame: int = 0, id_offset: int = 0) -> Iterator[FrameResult]:
-        """Yield one FrameResult per processed frame (every `stride`-th frame from `start_frame`).
+        """Yield one FrameResult per processed frame (every `stride`-th frame from `start_frame`), in order.
 
-        Frames are decoded on a background thread, so reading the next frame overlaps with detecting this one.
+        Three things run at once: a thread decodes the next frames, the model detects a batch of `batch` frames, and
+        a small thread pool draws and blurs the previous batch's output frames. Tracking stays in frame order.
         `start_frame` and `id_offset` resume an interrupted run: ByteTrack starts over at ID 1, so its IDs are shifted
         past the ones already saved. Camera motion is always measured against frame 0, as in an uninterrupted run."""
         cap = cv2.VideoCapture(video_path)
@@ -525,76 +628,167 @@ class RoadUserTracker:
         tmp = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
         tmp.close()
         _write_tracker_yaml(tmp.name, self.s, processed_fps)
-        reader = FrameReader(video_path, stride, start_frame)
+        B = max(1, int(self.s.batch))
+        reader = FrameReader(video_path, stride, start_frame, ahead=2 * B + 2)
+        pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="nearmiss-draw")
+        pending: Deque[Tuple[FrameResult, "Future"]] = deque()
+        self.timing.setdefault("track", 0.0)
+
+        def draw(frame, items, frame_idx, time_s):
+            t0 = time.perf_counter()
+            img = render_frame(frame, items, self.render, frame_idx, time_s)
+            self.timing["render"] += time.perf_counter() - t0      # summed over the drawing threads
+            return img
+
+        def emit():
+            fr, fut = pending.popleft()
+            fr.annotated = fut.result() if fut is not None else None
+            if progress_cb:
+                progress_cb(min(fr.frame_idx + stride, total_frames), total_frames)
+            return fr
+
         try:
             self.motion = CameraMotion() if self.s.stabilize else None
             if self.motion is not None and start_frame > 0:
                 self.motion.update(0, grab_first_frame(video_path))   # the same reference frame as the first part
+            tracker = self._new_tracker(tmp.name)
             ref_length = None
             hide_still = is_aerial(self.model_used) and finds_people(self.model_used)
             first_seen: Dict[int, Tuple[float, float]] = {}     # small road user -> first centre (reference pixels)
             confirmed = set()
-            clock = time.perf_counter()
-            for n, (frame_idx, frame) in enumerate(reader):
+            n = 0
+            for batch in _batches(reader, B):
+                clock = time.perf_counter()
                 try:
-                    result = self._track(frame, tmp.name)
+                    results = self._detect([f for _, f in batch])
                 except Exception as ex:
                     if self.device_used == "cpu" or n > 0:
                         raise
                     self.warning = (self.warning + " " if self.warning else "") + \
                         f"{device_label(self.device_used)} failed ({type(ex).__name__}); running on the CPU instead."
                     self.device_used = "cpu"
-                    self.model, _, _ = _load_model(self.model_used)     # fresh tracker state
+                    self.fast = None
+                    self.model, _, _ = _load_model(self.model_used)
                     self.classes = class_map(self.model.names)
-                    result = self._track(frame, tmp.name)
+                    results = self._detect([f for _, f in batch])
                 self.timing["model"] += time.perf_counter() - clock
-                time_s = round(frame_idx / fps, 3) if fps > 0 else 0.0
-                dets: List[Detection] = []
-                boxes = result.obb if result.obb is not None else result.boxes   # aerial models give rotated boxes
-                if boxes is not None and boxes.id is not None:
-                    xyxy = boxes.xyxy.cpu().numpy()
-                    confs = boxes.conf.cpu().numpy()
-                    cls_ids = boxes.cls.cpu().numpy().astype(int)
-                    ids = boxes.id.cpu().numpy().astype(int) + id_offset
-                    names = [self.classes.get(int(c), str(c)) for c in cls_ids]
-                    if hasattr(boxes, "xywhr"):     # overhead: car vs truck by length, not by the model's guess
-                        wh = boxes.xywhr[:, 2:4].cpu().numpy()
-                        names, ref_length = size_classes(wh.max(axis=1), wh.min(axis=1), ref_length)
-                    for (x1, y1, x2, y2), conf, name, tid in zip(xyxy, confs, names, ids):
-                        dets.append(Detection(frame_idx, time_s, int(tid), name,
-                                              round(float(conf), 3), float(x1), float(y1), float(x2), float(y2)))
-                t = time.perf_counter()
-                H = self.motion.update(frame_idx, frame, [(d.x1, d.y1, d.x2, d.y2) for d in dets]) if self.motion else None
-                self.timing["motion"] += time.perf_counter() - t
-                items = memory.update(n, dets, (frame.shape[1], frame.shape[0]))
-                if hide_still:
-                    for d in dets:
-                        if d.class_name not in SMALL_CLASSES or d.track_id in confirmed:
-                            continue
-                        c = np.array([d.center])
-                        if H is not None:
-                            c = cv2.perspectiveTransform(c[None], H)[0]
-                        start = first_seen.setdefault(d.track_id, tuple(c[0]))
-                        size = max(d.x2 - d.x1, d.y2 - d.y1)
-                        if np.hypot(c[0][0] - start[0], c[0][1] - start[1]) > CONFIRM_MOVE_BOXES * size:
-                            confirmed.add(d.track_id)
-                    items = [i for i in items if i.class_name not in SMALL_CLASSES or i.track_id in confirmed]
-                self.stats["frames"] += 1
-                if any(not i.live for i in items):
-                    self.stats["frames_with_carried_boxes"] += 1
-                t = time.perf_counter()
-                annotated = render_frame(frame, items, self.render, frame_idx, time_s)
-                self.timing["render"] += time.perf_counter() - t
-                yield FrameResult(frame_idx, time_s, annotated, dets, items, H)
-                if progress_cb:
-                    progress_cb(min(frame_idx + stride, total_frames), total_frames)
-                clock = time.perf_counter()
+                for (frame_idx, frame), result in zip(batch, results):
+                    clock = time.perf_counter()
+                    result = self._apply_tracks(result, tracker)
+                    self.timing["track"] += time.perf_counter() - clock
+                    dets, items, H, ref_length, time_s = self._frame(
+                        result, frame_idx, frame, fps, id_offset, n, memory, hide_still, first_seen, confirmed,
+                        ref_length)
+                    fut = pool.submit(draw, frame, items, frame_idx, time_s) if self.render.enabled else None
+                    pending.append((FrameResult(frame_idx, time_s, None, dets, items, H), fut))
+                    n += 1
+                while len(pending) > B:       # the last batch keeps drawing while the model works on the next one
+                    yield emit()
+            while pending:
+                yield emit()
         finally:
+            pool.shutdown(wait=False, cancel_futures=True)
             reader.close()
             try:
                 os.unlink(tmp.name)
             except OSError:
                 pass
+
+    def _frame(self, result, frame_idx, frame, fps, id_offset, n, memory, hide_still, first_seen, confirmed,
+               ref_length):
+        """Detections, camera motion and the boxes to draw for one tracked frame."""
+        time_s = round(frame_idx / fps, 3) if fps > 0 else 0.0
+        dets: List[Detection] = []
+        boxes = result.obb if result.obb is not None else result.boxes   # aerial models give rotated boxes
+        if boxes is not None and boxes.id is not None:
+            xyxy = boxes.xyxy.cpu().numpy()
+            confs = boxes.conf.cpu().numpy()
+            cls_ids = boxes.cls.cpu().numpy().astype(int)
+            ids = boxes.id.cpu().numpy().astype(int) + id_offset
+            names = [self.classes.get(int(c), str(c)) for c in cls_ids]
+            if hasattr(boxes, "xywhr"):     # overhead: car vs truck by length, not by the model's guess
+                wh = boxes.xywhr[:, 2:4].cpu().numpy()
+                names, ref_length = size_classes(wh.max(axis=1), wh.min(axis=1), ref_length)
+            for (x1, y1, x2, y2), conf, name, tid in zip(xyxy, confs, names, ids):
+                dets.append(Detection(frame_idx, time_s, int(tid), name,
+                                      round(float(conf), 3), float(x1), float(y1), float(x2), float(y2)))
+        t = time.perf_counter()
+        H = self.motion.update(frame_idx, frame, [(d.x1, d.y1, d.x2, d.y2) for d in dets]) if self.motion else None
+        self.timing["motion"] += time.perf_counter() - t
+        items = memory.update(n, dets, (frame.shape[1], frame.shape[0]))
+        if hide_still:
+            for d in dets:
+                if d.class_name not in SMALL_CLASSES or d.track_id in confirmed:
+                    continue
+                c = np.array([d.center])
+                if H is not None:
+                    c = cv2.perspectiveTransform(c[None], H)[0]
+                start = first_seen.setdefault(d.track_id, tuple(c[0]))
+                size = max(d.x2 - d.x1, d.y2 - d.y1)
+                if np.hypot(c[0][0] - start[0], c[0][1] - start[1]) > CONFIRM_MOVE_BOXES * size:
+                    confirmed.add(d.track_id)
+            items = [i for i in items if i.class_name not in SMALL_CLASSES or i.track_id in confirmed]
+        self.stats["frames"] += 1
+        if any(not i.live for i in items):
+            self.stats["frames_with_carried_boxes"] += 1
+        return dets, items, H, ref_length, time_s
+
+
+def _batches(it, size: int):
+    """Group an iterator into lists of up to `size` items."""
+    batch = []
+    for x in it:
+        batch.append(x)
+        if len(batch) == size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+def render_from_detections(video_path: str, det, out_path: str, fps: float, stride: int, render: RenderOptions,
+                           t0: float = 0.0, t1: Optional[float] = None, coast_s: float = 1.0, trail_s: float = 2.0,
+                           progress: Optional[Callable[[float], None]] = None) -> int:
+    """Draw the tracked video (blur, boxes, trails) from the original video and saved detections, for [t0, t1] or
+    the whole clip. Used when detection ran without drawing (fast mode): event clips are drawn when opened, and the
+    full tracked video only if asked for. Returns the number of frames written."""
+    from video_utils import AnnotatedVideoWriter
+
+    stride = max(1, int(stride))
+    start = max(0, int(np.floor(t0 * fps / stride)) * stride)
+    stop = int(np.ceil(t1 * fps)) if t1 is not None else None
+    by_frame: Dict[int, List[Detection]] = {}
+    names = {"pedestrian": "person"}                  # the analysis says pedestrian, the drawing colours use person
+    for i in range(len(det)):
+        f = int(det.frame[i])
+        if f < start - 3 * int(coast_s * fps) or (stop is not None and f > stop):
+            continue
+        x1, y1, x2, y2 = (float(v) for v in det.box[i])
+        by_frame.setdefault(f, []).append(Detection(f, float(det.t[i]), int(det.tid[i]),
+                                                     names.get(str(det.cls[i]), str(det.cls[i])),
+                                                     float(det.conf[i]), x1, y1, x2, y2))
+    pfps = fps / stride
+    memory = PersistentTracks(int(round(coast_s * pfps)), int(round(trail_s * pfps)))
+    # warm the memory up with the frames just before t0, so boxes and trails are already there at the start
+    for n, f in enumerate(range(max(0, start - 3 * int(coast_s * fps) // stride * stride), start, stride)):
+        memory.update(n, by_frame.get(f, []), (1, 1))
+    n0 = len(range(max(0, start - 3 * int(coast_s * fps) // stride * stride), start, stride))
+    writer = AnnotatedVideoWriter(out_path, pfps)
+    reader = FrameReader(video_path, stride, start)
+    written = 0
+    try:
+        for k, (f, frame) in enumerate(reader):
+            if stop is not None and f > stop:
+                break
+            items = memory.update(n0 + k, by_frame.get(f, []), (frame.shape[1], frame.shape[0]))
+            writer.write(render_frame(frame, items, render, f, round(f / fps, 3)))
+            written += 1
+            if progress and stop:
+                progress(min(1.0, (f - start) / max(stop - start, 1)))
+    finally:
+        reader.close()
+        writer.release()
+    return written
 
 
 def grab_first_frame(video_path: str) -> np.ndarray:

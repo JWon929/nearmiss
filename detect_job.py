@@ -129,18 +129,21 @@ def run_job(run: Path, progress: Optional[Callable[[int, int, float], None]] = N
                                          id_offset=job["max_track_id"]):
             if chunk_end is not None and res.frame_idx >= chunk_end:
                 close_chunk(res.frame_idx)
-            if writer is None:
-                k = len(job["chunks"])
-                writer = AnnotatedVideoWriter(str(pd / f"chunk_{k:03d}.mp4"), fps / stride)
+                chunk_end = None
+            if chunk_end is None:
                 chunk_end = res.frame_idx + chunk_frames
-            writer.write(res.annotated)
+                if res.annotated is not None:          # no tracked video in fast mode: only detections are saved
+                    k = len(job["chunks"])
+                    writer = AnnotatedVideoWriter(str(pd / f"chunk_{k:03d}.mp4"), fps / stride)
+            if writer is not None and res.annotated is not None:
+                writer.write(res.annotated)
             rows.extend(_row(x) for x in res.detections)
             if progress:
                 done = res.frame_idx - done_at_start
                 rate = done / max(time.time() - t_start, 1e-6)
                 left = (total - res.frame_idx) / rate if done > 3 * stride and time.time() - t_start > 3 else -1
                 progress(res.frame_idx, total, left)
-            if preview and time.time() - last_preview > 1.0:     # sending a picture to the browser costs time
+            if preview and res.annotated is not None and time.time() - last_preview > 1.0:  # pictures cost time
                 preview(res.annotated)
                 last_preview = time.time()
         close_chunk(total)

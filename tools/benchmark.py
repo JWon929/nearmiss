@@ -71,7 +71,8 @@ def bench_analysis(n_tracks: int, minutes: float) -> None:
     timed("vehicle_size_check", vehicle_size_check, det, cal, Settings(ground_point="center"), motion)
 
 
-def bench_detect(video: str, seconds: float, model: str, stabilize: bool, device: str = "cpu") -> None:
+def bench_detect(video: str, seconds: float, model: str, stabilize: bool, device: str = "cpu",
+                 analysis_fps: float = 12.0, batch: int = 8, draw_video: bool = True) -> None:
     import cv2
 
     from detector_tracker import RenderOptions, RoadUserTracker, TrackerSettings, auto_stride
@@ -90,24 +91,33 @@ def bench_detect(video: str, seconds: float, model: str, stabilize: bool, device
     out.release()
     cap.release()
 
-    stride = auto_stride(m["fps"])
+    stride = auto_stride(m["fps"], analysis_fps)
     t_load = time.perf_counter()
-    tracker = RoadUserTracker(TrackerSettings(model_name=model, stride=stride, stabilize=stabilize, device=device),
-                              RenderOptions())
+    tracker = RoadUserTracker(TrackerSettings(model_name=model, stride=stride, stabilize=stabilize, device=device,
+                                              batch=batch), RenderOptions(enabled=draw_video))
     t_load = time.perf_counter() - t_load
     writer =AnnotatedVideoWriter(str(Path(clip).with_name("bench_out.mp4")), m["fps"] / stride)
     t0 = time.perf_counter()
     n = dets = 0
     t_write = 0.0
     t_first = None
+    seen = {}                                          # track id -> (first time, last time, class)
     for res in tracker.process_video(clip, m["fps"]):
         if t_first is None:
             t_first = time.perf_counter() - t0
         t = time.perf_counter()
-        writer.write(res.annotated)
+        if res.annotated is not None:
+            writer.write(res.annotated)
         t_write += time.perf_counter() - t
         n += 1
         dets += len(res.detections)
+        for d in res.detections:
+            a = seen.get(d.track_id)
+            seen[d.track_id] = (a[0] if a else d.time_s, d.time_s, d.class_name)
+    long = [v for v in seen.values() if v[1] - v[0] >= 1.0]
+    print(f"  tracks: {len(seen)} in total, {len(long)} lasting 1 s or more "
+          f"({sum(v[2] == 'car' for v in long)} cars, {sum(v[2] == 'person' for v in long)} people), "
+          f"median length {np.median([v[1] - v[0] for v in long]) if long else 0:.1f} s")
     writer.release()
     total = time.perf_counter() - t0
     print(f"{n} frames ({seconds:g} s of {m['width']}x{m['height']} video at {m['fps']:g} fps, stride {stride}), "
@@ -135,8 +145,12 @@ if __name__ == "__main__":
     d.add_argument("--model", default="yolov8n.pt")
     d.add_argument("--stabilize", action="store_true")
     d.add_argument("--device", default="cpu", help="cpu, auto, intel:gpu, intel:npu, cuda:0, mps")
+    d.add_argument("--fps", type=float, default=12.0, help="frames analysed per second of video")
+    d.add_argument("--batch", type=int, default=8)
+    d.add_argument("--no-video", action="store_true", help="skip drawing and writing the tracked video")
     args = ap.parse_args()
     if args.cmd == "analysis":
         bench_analysis(args.tracks, args.minutes)
     else:
-        bench_detect(args.video, args.seconds, args.model, args.stabilize, args.device)
+        bench_detect(args.video, args.seconds, args.model, args.stabilize, args.device, args.fps, args.batch,
+                     not args.no_video)

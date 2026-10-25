@@ -15,11 +15,20 @@ Click **Load synthetic demo** in the sidebar to try every page without footage. 
 built, `CONTRIBUTING.md` before changing it, and `DATA.md` for the data statement to fill in.
 
 ## Speed
-- **Device:** *auto* uses an NVIDIA GPU, an Apple chip, or an **Intel GPU through OpenVINO** (exported once into
-  `openvino_cache/`). On an Intel Core Ultra 5 226V laptop, YOLOv8n at 960 px took about 35 ms per frame on the Arc GPU
-  against 90-180 ms on the CPU (it varies with the laptop's power state).
-- Frames are decoded on a background thread while the model works, and the detection libraries load in the background
-  as soon as Detect opens.
+Detect has three speed modes. Measured on 2 min of a 1280x720 clip, Intel Core Ultra 5 226V **on mains power**
+(on a nearly empty battery Windows throttles the GPU and it was 5-10x slower):
+
+| Mode | Frames analysed | Tracked video | Speed vs real time | Tracks of 1 s+ on the test clip |
+| --- | --- | --- | --- | --- |
+| Full | 12 / s | drawn while detecting | ~4.5x | 96 (80 cars, 13 people) |
+| Fast (default) | 12 / s | drawn later, only if asked | ~6x | 96, identical to Full |
+| Fastest | 6 / s | drawn later, only if asked | ~15x | 60 (55 cars, 5 people) |
+
+How: *auto* uses an NVIDIA GPU, an Apple chip, or an **Intel GPU through OpenVINO** (exported once into
+`openvino_cache/`). Frames go to the model 8 at a time, and the image conversion runs on the Intel GPU instead of the
+CPU (it used to take twice as long as the model itself; the boxes are identical, see `tests/test_fast_openvino.py`).
+Frames are decoded on one thread and drawn on others while the model works. Without the tracked video, event clips are
+drawn from the original video when you open them, and Results > Slow-motion video can draw the whole video later.
 - **Resume:** every 30 s of video is saved as it finishes. A stopped, crashed or closed run shows on Detect with
   *Resume*; at most 30 s is redone. A road user visible across the resume point gets a new ID after it.
 - **Batch:** choose several clips at once; they run one after another, each as its own recording.
