@@ -6,11 +6,24 @@ Fixed-camera video -> detect and track road users -> calibrate to metres -> flag
 (closest approach, time to collision, post-encroachment time) -> review each flag yourself -> report.
 
 ## Run
+Windows: `.\setup.ps1`. Mac or Linux: `./setup.sh`. Or by hand:
 ```
 pip install -r requirements.txt
 streamlit run app.py
 ```
-Click **Load synthetic demo** in the sidebar to try every page without footage.
+Click **Load synthetic demo** in the sidebar to try every page without footage. See `ARCHITECTURE.md` for how it is
+built, `CONTRIBUTING.md` before changing it, and `DATA.md` for the data statement to fill in.
+
+## Speed
+- **Device:** *auto* uses an NVIDIA GPU, an Apple chip, or an **Intel GPU through OpenVINO** (exported once into
+  `openvino_cache/`). On an Intel Core Ultra 5 226V laptop, YOLOv8n at 960 px took about 35 ms per frame on the Arc GPU
+  against 90-180 ms on the CPU (it varies with the laptop's power state).
+- Frames are decoded on a background thread while the model works, and the detection libraries load in the background
+  as soon as Detect opens.
+- **Resume:** every 30 s of video is saved as it finishes. A stopped, crashed or closed run shows on Detect with
+  *Resume*; at most 30 s is redone. A road user visible across the resume point gets a new ID after it.
+- **Batch:** choose several clips at once; they run one after another, each as its own recording.
+- `python tools/benchmark.py analysis` and `python tools/benchmark.py detect CLIP --device auto` time each stage.
 
 ## What changed from Phase 1
 - Boxes no longer flash: weak detections extend existing tracks, lost tracks are kept 3 s, and a missed box is
@@ -70,6 +83,19 @@ Road users outside it (parked cars in a lot, people on the sidewalk) are ignored
 - **Street furniture** (drone footage only): pedestrians and bikes that never move are left out, and shown on
   Results > Quality so a real waiting person can be restored. Street-level footage is never filtered this way.
 - **Reports** are marked out of date when labels, calibration, settings or details change after they were built.
+
+## Extra indicators, presets and calibration fit
+- **PET flagging** (Results > Thresholds, off by default): flags crossing paths where the second road user reached the
+  crossing point soon after the first left it, even if they were never in the scene together. TTC cannot see these.
+- **DRAC** (braking needed to avoid the collision) is shown for every event; it can also raise the severity.
+- **Presets** for urban intersections, parking lots, roundabouts and arterials set the thresholds to a starting point.
+  They change only thresholds; check them on your labels (Report > Tuning).
+- **Several known distances** on Calibrate: keep each check, then fit the scale to all of them. With three or more,
+  the app reports the leave-one-out error, the honest accuracy estimate.
+- **Compare two models** on the start of a clip from Detect, with pictures side by side.
+- **Precision by condition** (Report > Validation > All recordings): grouped by lighting, weather, camera view, camera
+  or model, from the recording details.
+- In Event Review the distance chart marks the frame being viewed; click the chart to jump there.
 
 ## Movements, signal phases and before/after
 Results > Traffic & movements names each road user's approach (northbound...) and turn (through, left, right),

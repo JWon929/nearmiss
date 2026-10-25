@@ -34,7 +34,11 @@ analysis fills short gaps by interpolation (engine/trajectories.py).
 from __future__ import annotations
 
 import os
+import queue
+import shutil
 import tempfile
+import threading
+import time
 from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -176,7 +180,25 @@ def auto_stride(fps: float, target_fps: float = 12.0) -> int:
     return max(1, int(round(fps / target_fps))) if fps > 0 else 1
 
 
+_INTEL: Optional[List[str]] = None
+
+
+def intel_devices() -> List[str]:
+    """OpenVINO devices on this computer ("GPU", "NPU", "CPU"), or [] without OpenVINO. Checked once."""
+    global _INTEL
+    if _INTEL is None:
+        try:
+            import openvino as ov
+
+            _INTEL = [d.split(".")[0] for d in ov.Core().available_devices]
+        except Exception:
+            _INTEL = []
+    return _INTEL
+
+
 def pick_device(preference: str = "auto") -> str:
+    """auto: an NVIDIA GPU, else an Apple chip, else an Intel GPU through OpenVINO, else the CPU.
+    PyTorch cannot use Intel GPUs; OpenVINO ran YOLOv8n about 4x faster on an Arc 130V than PyTorch on the CPU."""
     if preference != "auto":
         return preference
     try:
@@ -189,7 +211,14 @@ def pick_device(preference: str = "auto") -> str:
             return "mps"
     except Exception:
         pass
+    if "GPU" in intel_devices():
+        return "intel:gpu"
     return "cpu"
+
+
+def device_label(device: str) -> str:
+    return {"cpu": "CPU", "mps": "Apple chip", "cuda:0": "NVIDIA GPU", "intel:gpu": "Intel GPU (OpenVINO)",
+            "intel:npu": "Intel NPU (OpenVINO)", "intel:cpu": "CPU (OpenVINO)"}.get(device, device)
 
 
 # -------------------------------------------------------------------------------- data
@@ -401,6 +430,43 @@ def _load_model(name: str):
         return model, fallback, f"Could not load {name} ({type(ex).__name__}); using {fallback} instead."
 
 
+def input_shape(imgsz: int, frame_wh: Optional[Tuple[int, int]] = None) -> Tuple[int, int]:
+    """(height, width) the model sees: the long side is `imgsz`, the short side keeps the video's shape, rounded up to
+    a multiple of 32. A 16:9 video at 960 becomes 544 x 960 instead of a 960 x 960 square that is 43% padding, the
+    same shape PyTorch picks itself, so boxes match and the Intel GPU does ~40% less work."""
+    if not frame_wh:
+        return imgsz, imgsz
+    w, h = frame_wh
+    s = imgsz / max(w, h)
+    pad = lambda v: int(np.ceil(v * s / 32) * 32)
+    return (imgsz, pad(w)) if h >= w else (pad(h), imgsz)
+
+
+def openvino_dir(name: str, shape: Tuple[int, int]) -> Path:
+    """Where the OpenVINO copy of a model is cached (one per input shape, since an exported model's shape is fixed)."""
+    return HERE / "openvino_cache" / f"{Path(name).stem}_{shape[0]}x{shape[1]}_openvino_model"   # suffix needed
+
+
+def _load_openvino(name: str, shape: Tuple[int, int]):
+    """The OpenVINO version of `name` for this input shape, exported on first use (a few seconds) and cached.
+    FP16 weights: as accurate as FP32 here and a little faster on Intel GPUs and NPUs."""
+    from ultralytics import YOLO
+
+    target = openvino_dir(name, shape)
+    if not (target / "metadata.yaml").exists():
+        torch_model, used, _ = _load_model(name)
+        exported = Path(torch_model.export(format="openvino", imgsz=list(shape), half=True, verbose=False))
+        target.parent.mkdir(exist_ok=True)
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.move(str(exported), str(target))
+    import yaml                                  # comes with ultralytics
+
+    # class names straight from the export's metadata: asking the model for .names would first compile it on the CPU
+    names = {int(k): v for k, v in yaml.safe_load((target / "metadata.yaml").read_text())["names"].items()}
+    return YOLO(str(target), task="obb" if "-obb" in name else "detect"), names
+
+
 class RoadUserTracker:
     """YOLO + ByteTrack over a video. Yields one FrameResult per processed frame."""
 
@@ -409,29 +475,45 @@ class RoadUserTracker:
         self.render = render or RenderOptions()
         self.model, self.model_used, self.warning = _load_model(self.s.model_name)
         self.device_used = pick_device(self.s.device)
-        self.classes = class_map(self.model.names)
+        self.classes = class_map(self.model.names)       # reading names from the PyTorch weights compiles nothing
+        self.shape = (self.s.imgsz, self.s.imgsz)
+
+    def _prepare_intel(self, frame_wh: Tuple[int, int]) -> None:
+        """Swap in the OpenVINO model once the video's shape is known; on any problem stay on the CPU."""
+        if not self.device_used.startswith("intel:"):
+            return
+        self.shape = input_shape(self.s.imgsz, frame_wh)
+        try:
+            self.model, names = _load_openvino(self.model_used, self.shape)
+            self.classes = class_map(names)
+        except Exception as ex:
+            self.warning = (self.warning + " " if self.warning else "") + \
+                f"The fast {device_label(self.device_used)} model could not be prepared ({type(ex).__name__}); " \
+                "running on the CPU instead."
+            self.device_used = "cpu"
+            self.shape = (self.s.imgsz, self.s.imgsz)
         self.motion = None
         self.stats = {"frames": 0, "frames_with_carried_boxes": 0}
+        self.timing = {"model": 0.0, "motion": 0.0, "render": 0.0}   # seconds spent in each stage (tools/benchmark.py)
 
-    def _stream(self, video_path: str, yaml_path: str, device: str):
-        return self.model.track(
-            source=video_path,
-            classes=list(self.classes),
-            conf=self.s.detector_conf,
-            imgsz=self.s.imgsz,
-            device=device,
-            vid_stride=max(1, self.s.stride),
-            persist=True,
-            stream=True,
-            tracker=yaml_path,
-            verbose=False,
-        )
+    def _track(self, frame: np.ndarray, yaml_path: str):
+        """Detect + track one frame. persist=True keeps ByteTrack's state from the previous call."""
+        imgsz = list(self.shape) if self.device_used.startswith("intel:") else self.s.imgsz
+        return self.model.track(frame, classes=list(self.classes), conf=self.s.detector_conf, imgsz=imgsz,
+                                device=self.device_used, persist=True, tracker=yaml_path, verbose=False)[0]
 
-    def process_video(self, video_path: str, fps: float, progress_cb: Optional[Callable[[int, int], None]] = None
-                      ) -> Iterator[FrameResult]:
+    def process_video(self, video_path: str, fps: float, progress_cb: Optional[Callable[[int, int], None]] = None,
+                      start_frame: int = 0, id_offset: int = 0) -> Iterator[FrameResult]:
+        """Yield one FrameResult per processed frame (every `stride`-th frame from `start_frame`).
+
+        Frames are decoded on a background thread, so reading the next frame overlaps with detecting this one.
+        `start_frame` and `id_offset` resume an interrupted run: ByteTrack starts over at ID 1, so its IDs are shifted
+        past the ones already saved. Camera motion is always measured against frame 0, as in an uninterrupted run."""
         cap = cv2.VideoCapture(video_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        frame_wh = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
         cap.release()
+        self._prepare_intel(frame_wh)
         stride = max(1, self.s.stride)
         processed_fps = (fps / stride) if fps > 0 else 10.0
         memory = PersistentTracks(
@@ -443,43 +525,37 @@ class RoadUserTracker:
         tmp = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
         tmp.close()
         _write_tracker_yaml(tmp.name, self.s, processed_fps)
+        reader = FrameReader(video_path, stride, start_frame)
         try:
-            device = self.device_used
-            try:
-                stream = self._stream(video_path, tmp.name, device)
-                first = next(stream, None)
-            except Exception as ex:
-                if device == "cpu":
-                    raise
-                self.warning = (self.warning + " " if self.warning else "") + \
-                    f"{device} failed ({type(ex).__name__}); running on the CPU instead."
-                self.device_used = device = "cpu"
-                self.model, _, _ = _load_model(self.model_used)     # fresh tracker state
-                self.classes = class_map(self.model.names)
-                stream = self._stream(video_path, tmp.name, device)
-                first = next(stream, None)
-
-            def results():
-                if first is not None:
-                    yield first
-                yield from stream
-
             self.motion = CameraMotion() if self.s.stabilize else None
+            if self.motion is not None and start_frame > 0:
+                self.motion.update(0, grab_first_frame(video_path))   # the same reference frame as the first part
             ref_length = None
             hide_still = is_aerial(self.model_used) and finds_people(self.model_used)
             first_seen: Dict[int, Tuple[float, float]] = {}     # small road user -> first centre (reference pixels)
             confirmed = set()
-            for n, result in enumerate(results()):
-                frame_idx = n * stride
+            clock = time.perf_counter()
+            for n, (frame_idx, frame) in enumerate(reader):
+                try:
+                    result = self._track(frame, tmp.name)
+                except Exception as ex:
+                    if self.device_used == "cpu" or n > 0:
+                        raise
+                    self.warning = (self.warning + " " if self.warning else "") + \
+                        f"{device_label(self.device_used)} failed ({type(ex).__name__}); running on the CPU instead."
+                    self.device_used = "cpu"
+                    self.model, _, _ = _load_model(self.model_used)     # fresh tracker state
+                    self.classes = class_map(self.model.names)
+                    result = self._track(frame, tmp.name)
+                self.timing["model"] += time.perf_counter() - clock
                 time_s = round(frame_idx / fps, 3) if fps > 0 else 0.0
-                frame = result.orig_img
                 dets: List[Detection] = []
                 boxes = result.obb if result.obb is not None else result.boxes   # aerial models give rotated boxes
                 if boxes is not None and boxes.id is not None:
                     xyxy = boxes.xyxy.cpu().numpy()
                     confs = boxes.conf.cpu().numpy()
                     cls_ids = boxes.cls.cpu().numpy().astype(int)
-                    ids = boxes.id.cpu().numpy().astype(int)
+                    ids = boxes.id.cpu().numpy().astype(int) + id_offset
                     names = [self.classes.get(int(c), str(c)) for c in cls_ids]
                     if hasattr(boxes, "xywhr"):     # overhead: car vs truck by length, not by the model's guess
                         wh = boxes.xywhr[:, 2:4].cpu().numpy()
@@ -487,7 +563,9 @@ class RoadUserTracker:
                     for (x1, y1, x2, y2), conf, name, tid in zip(xyxy, confs, names, ids):
                         dets.append(Detection(frame_idx, time_s, int(tid), name,
                                               round(float(conf), 3), float(x1), float(y1), float(x2), float(y2)))
+                t = time.perf_counter()
                 H = self.motion.update(frame_idx, frame, [(d.x1, d.y1, d.x2, d.y2) for d in dets]) if self.motion else None
+                self.timing["motion"] += time.perf_counter() - t
                 items = memory.update(n, dets, (frame.shape[1], frame.shape[0]))
                 if hide_still:
                     for d in dets:
@@ -504,11 +582,90 @@ class RoadUserTracker:
                 self.stats["frames"] += 1
                 if any(not i.live for i in items):
                     self.stats["frames_with_carried_boxes"] += 1
-                yield FrameResult(frame_idx, time_s, render_frame(frame, items, self.render, frame_idx, time_s), dets, items, H)
+                t = time.perf_counter()
+                annotated = render_frame(frame, items, self.render, frame_idx, time_s)
+                self.timing["render"] += time.perf_counter() - t
+                yield FrameResult(frame_idx, time_s, annotated, dets, items, H)
                 if progress_cb:
                     progress_cb(min(frame_idx + stride, total_frames), total_frames)
+                clock = time.perf_counter()
         finally:
+            reader.close()
             try:
                 os.unlink(tmp.name)
             except OSError:
                 pass
+
+
+def grab_first_frame(video_path: str) -> np.ndarray:
+    cap = cv2.VideoCapture(video_path)
+    ok, frame = cap.read()
+    cap.release()
+    if not ok:
+        raise ValueError(f"Could not read the first frame of {video_path}")
+    return frame
+
+
+class FrameReader:
+    """Decodes every `stride`-th frame from `start` on a background thread, a few frames ahead of the detector.
+
+    Skipped frames are only grabbed (not decoded into images), which is most of the cost of reading. Iterating yields
+    (frame index in the original video, BGR frame)."""
+
+    def __init__(self, path: str, stride: int = 1, start: int = 0, ahead: int = 6):
+        self.path, self.stride, self.start = path, max(1, int(stride)), max(0, int(start))
+        self._q: "queue.Queue" = queue.Queue(maxsize=ahead)
+        self._stop = threading.Event()
+        self._error: Optional[BaseException] = None
+        self._t = threading.Thread(target=self._run, daemon=True)
+        self._t.start()
+
+    def _run(self) -> None:
+        cap = cv2.VideoCapture(self.path)
+        try:
+            if not cap.isOpened():
+                raise ValueError(f"Could not open video: {self.path}")
+            idx = 0
+            if self.start:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, self.start)
+                idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+                if idx != self.start:                      # inexact seek: start over and grab forward
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    idx = 0
+                    while idx < self.start and cap.grab():
+                        idx += 1
+            while not self._stop.is_set():
+                if not cap.grab():
+                    break
+                if (idx - self.start) % self.stride == 0:
+                    ok, frame = cap.retrieve()
+                    if not ok:
+                        break
+                    self._put((idx, frame))
+                idx += 1
+        except BaseException as ex:                        # handed to the consumer, never lost on the thread
+            self._error = ex
+        finally:
+            cap.release()
+            self._put(None)
+
+    def _put(self, item) -> None:
+        while not self._stop.is_set():
+            try:
+                self._q.put(item, timeout=0.2)
+                return
+            except queue.Full:
+                continue
+
+    def __iter__(self):
+        while True:
+            item = self._q.get()
+            if item is None:
+                if self._error is not None:
+                    raise self._error
+                return
+            yield item
+
+    def close(self) -> None:
+        self._stop.set()
+        self._t.join(timeout=2)

@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
+import numpy as np
+
 CHECK_LIMIT_PCT = 10.0
 
 
@@ -27,6 +29,19 @@ def calibration_status(cal: Optional[Dict], size_check: Optional[Dict] = None, s
                 "provisional": True}
     checks = cal.get("checks") or []
     size_warn = (size_check or {}).get("warning")
+    if len(checks) > 1:                              # several known distances: judge by their typical (RMS) error
+        rms = float(np.sqrt(np.mean([c["error_pct"] ** 2 for c in checks])))
+        worst = max(checks, key=lambda c: abs(c["error_pct"]))
+        if rms > CHECK_LIMIT_PCT:
+            return {"level": "problem", "title": f"Calibration off by about {rms:.0f}% ({len(checks)} checks)",
+                    "detail": f"The worst: a known {worst['known_m']} m measured {worst['measured_m']} m. Fit the scale "
+                              "to all distances on Calibrate, or re-click the calibration points.", "provisional": True}
+        if size_warn:
+            return {"level": "problem", "title": "Calibration scale looks wrong", "detail": size_warn,
+                    "provisional": True}
+        return {"level": "good", "title": f"Calibration checked ({len(checks)} distances, typical error {rms:.1f}%)",
+                "detail": f"The worst: a known {worst['known_m']} m measured {worst['measured_m']} m.",
+                "provisional": False}
     if checks and abs(checks[0]["error_pct"]) > CHECK_LIMIT_PCT:
         c = checks[0]
         return {"level": "problem", "title": f"Calibration off by {c['error_pct']:+.0f}%",

@@ -29,6 +29,31 @@ import cv2
 import numpy as np
 
 
+def fit_scale(cal: "Calibration", checks: List[Dict]) -> Dict:
+    """Least-squares scale correction from several known distances.
+
+    Each check is {"p1": [x, y], "p2": [x, y], "known_m": L} in calibration-frame pixels. The calibration measures
+    m_i; the scale s minimising sum (s m_i - L_i)^2 / L_i^2 (percent errors weigh the same for short and long
+    distances) corrects a mistyped rectangle size or an imprecise click. The leave-one-out error (fit without one
+    distance, test on it) is the honest accuracy estimate: the fitted error on the same distances is optimistic."""
+    m = np.array([cal.distance_between(c["p1"], c["p2"]) for c in checks], dtype=float)
+    L = np.array([float(c["known_m"]) for c in checks], dtype=float)
+    w = 1.0 / L ** 2
+
+    def scale(idx):
+        return float(np.sum(w[idx] * m[idx] * L[idx]) / np.sum(w[idx] * m[idx] ** 2))
+
+    s = scale(np.arange(len(m)))
+    before = 100 * (m - L) / L
+    after = 100 * (s * m - L) / L
+    loo = [100 * (scale(np.delete(np.arange(len(m)), i)) * m[i] - L[i]) / L[i] for i in range(len(m))] \
+        if len(m) >= 3 else []
+    rms = lambda e: float(np.sqrt(np.mean(np.square(e)))) if len(e) else None
+    return {"scale": s, "measured_m": m.round(3).tolist(), "error_before_pct": before.round(1).tolist(),
+            "error_after_pct": after.round(1).tolist(), "rms_before_pct": rms(before), "rms_after_pct": rms(after),
+            "rms_leave_one_out_pct": rms(loo), "n": len(m)}
+
+
 class CalibrationError(ValueError):
     """The clicked points / lengths cannot define a usable calibration."""
 
@@ -296,6 +321,14 @@ class Calibration:
             rot=np.array(d["rot"], dtype=np.float64),
             frame_size=tuple(d["frame_size"]),
         )
+        cal._w_sign = cal._centroid_w_sign()
+        return cal
+
+    def rescaled(self, s: float) -> "Calibration":
+        """The same calibration with every distance multiplied by s (see fit_scale)."""
+        cal = Calibration(image_points=self.image_points.copy(), width_m=self.width_m * s,
+                          length_m=self.length_m * s, H=np.diag([s, s, 1.0]) @ self.H, rot=self.rot.copy(),
+                          frame_size=self.frame_size)
         cal._w_sign = cal._centroid_w_sign()
         return cal
 

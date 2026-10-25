@@ -11,3 +11,4 @@ runs/
 !sample_data/*.mp4
 _orig_phase1/
 nearmiss/
+openvino_cache/

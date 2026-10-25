@@ -125,11 +125,26 @@ def to_reference(points: np.ndarray, frames: np.ndarray, motion: Optional[Dict[i
     points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
     if not motion:
         return points
-    keys = np.array(sorted(motion))
-    out = np.empty_like(points)
-    for f in np.unique(frames):
-        sel = frames == f
-        k = keys[np.argmin(np.abs(keys - f))]
-        ph = np.c_[points[sel], np.ones(sel.sum())] @ motion[int(k)].T
-        out[sel] = ph[:, :2] / ph[:, 2:3]
-    return out
+    keys, stack = _stacked(motion)
+    frames = np.asarray(frames)
+    # nearest frame with a transform: compare the neighbours on each side of the insertion point
+    j = np.clip(np.searchsorted(keys, frames), 1, len(keys) - 1) if len(keys) > 1 else np.zeros(len(frames), int)
+    if len(keys) > 1:
+        j = np.where(np.abs(keys[j - 1] - frames) <= np.abs(keys[j] - frames), j - 1, j)
+    ph = np.einsum("nij,nj->ni", stack[j], np.c_[points, np.ones(len(points))])
+    return ph[:, :2] / ph[:, 2:3]
+
+
+_STACK_CACHE: Dict[int, tuple] = {}
+
+
+def _stacked(motion: Dict[int, np.ndarray]):
+    """Sorted frame numbers and their transforms as one (K, 3, 3) array, built once per motion table."""
+    key = id(motion)
+    hit = _STACK_CACHE.get(key)
+    if hit is None or hit[0] is not motion:
+        keys = np.array(sorted(motion))
+        hit = (motion, keys, np.stack([motion[int(k)] for k in keys]))
+        _STACK_CACHE.clear()                  # keep one: a table is reused for every track of one recording
+        _STACK_CACHE[key] = hit
+    return hit[1], hit[2]

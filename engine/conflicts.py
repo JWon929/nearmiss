@@ -19,7 +19,11 @@ Two indicators are computed for every pair; the event severity is the worse:
            radius" R. Solve |r + v tau| = R for the smallest tau >= 0.
  2. Proximity - the actual minimum separation d_min reached during the encounter.
 
-Also reported (not used to flag in this version): PET, the post-encroachment
+Optional indicators (Settings.pet_flagging, Settings.drac_flagging; off by default until validated):
+ 3. DRAC  - deceleration rate to avoid the crash, closing speed / (2 TTC). Always reported.
+ 4. PET   - flags crossing paths, including pairs never on a collision course at the same instant.
+
+PET, the post-encroachment
 time for paths that cross: the time from the first road user LEAVING the shared
 conflict area to the second ENTERING it (FHWA SSAM definition), 0 if both were
 in it at once. Each road user occupies the conflict point from when its front
@@ -147,11 +151,8 @@ def _occupancy(track: Track, k: int, P: np.ndarray, r: float) -> Tuple[float, fl
     return enter, leave
 
 
-def post_encroachment_time(A: Track, B: Track, R: float, min_angle_deg: float = 30.0) -> Optional[float]:
-    """FHWA post-encroachment time: from the first road user's back clearing the conflict point to the second one's
-    front reaching it. The conflict point is where the two paths come closest; each road user occupies it while its
-    centre is within its half-length (HALF_LENGTH_M) of it. 0 when both occupied it at the same time. Only for
-    crossing paths (headings differ by >= 30 deg); None if the paths never come within R of each other."""
+def pet_details(A: Track, B: Track, R: float, min_angle_deg: float = 30.0) -> Optional[Dict]:
+    """FHWA post-encroachment time with where and when it happened. See post_encroachment_time."""
     D = np.linalg.norm(A.xy[:, None, :] - B.xy[None, :, :], axis=2)
     i, j = np.unravel_index(np.argmin(D), D.shape)
     if D[i, j] > R:
@@ -168,8 +169,30 @@ def post_encroachment_time(A: Track, B: Track, R: float, min_angle_deg: float = 
     a_in, a_out = _occupancy(A, int(i), P, max(HALF_LENGTH_M.get(A.cls, 1.0), reach))
     b_in, b_out = _occupancy(B, int(j), P, max(HALF_LENGTH_M.get(B.cls, 1.0), reach))
     if a_in <= b_out and b_in <= a_out:
-        return 0.0                                  # both were in the conflict area at once
-    return b_in - a_out if a_out < b_in else a_in - b_out
+        pet = 0.0                                   # both were in the conflict area at once
+    else:
+        pet = b_in - a_out if a_out < b_in else a_in - b_out
+    a_first = a_in <= b_in
+    return {"pet": float(pet), "P": P, "path_gap_m": float(D[i, j]), "i": int(i), "j": int(j),
+            "t_start": min(a_in, b_in), "t_end": max(a_out, b_out), "t_second_in": b_in if a_first else a_in,
+            "a_first": a_first}
+
+
+def post_encroachment_time(A: Track, B: Track, R: float, min_angle_deg: float = 30.0) -> Optional[float]:
+    """FHWA post-encroachment time: from the first road user's back clearing the conflict point to the second one's
+    front reaching it. The conflict point is where the two paths come closest; each road user occupies it while its
+    centre is within its half-length (HALF_LENGTH_M) of it. 0 when both occupied it at the same time. Only for
+    crossing paths (headings differ by >= 30 deg); None if the paths never come within R of each other."""
+    d = pet_details(A, B, R, min_angle_deg)
+    return None if d is None else d["pet"]
+
+
+def _level(value: float, thr: List[float], higher_is_worse: bool = False) -> int:
+    """0-3 from [candidate, moderate, serious] thresholds."""
+    for lvl, t in ((3, thr[2]), (2, thr[1]), (1, thr[0])):
+        if (value >= t) if higher_is_worse else (value <= t):
+            return lvl
+    return 0
 
 
 def _analyze_pair(A: Track, B: Track, kind: str, S: Settings, dt: float, dropped: Dict[str, int]) -> List[Dict]:
@@ -252,7 +275,11 @@ def _analyze_pair(A: Track, B: Track, kind: str, S: Settings, dt: float, dropped
                     lvl_t = 0
                     dropped["no_evasive_action"] += 1
         lvl_p = _level_from_prox(d_flag, prox_thr) if len(flagged) else 0
-        level = max(lvl_t, lvl_p)
+        # DRAC on the samples that were on a collision course (and survived the TTC filters)
+        on_course = run[vt & (ttc[run] > 0.05)]
+        drac_max = float((closing[on_course] / (2.0 * ttc[on_course])).max()) if len(on_course) else 0.0
+        lvl_d = _level(drac_max, S.drac_mps2, higher_is_worse=True) if (S.drac_flagging and lvl_t) else 0
+        level = max(lvl_t, lvl_p, lvl_d)
         if level == 0:
             if raw_ttc[run].any() and not vt.any():
                 dropped["ttc_too_brief"] += 1
@@ -286,6 +313,9 @@ def _analyze_pair(A: Track, B: Track, kind: str, S: Settings, dt: float, dropped
         if lvl_p:
             thr = prox_thr[lvl_p - 1]
             reasons.append("Came within %.1f m (<= %.1f m, %s threshold for %s)" % (d_flag, thr, SEVERITY_LEVELS[lvl_p], KIND_LABEL[kind].lower()))
+        if lvl_d:
+            reasons.append("Needed %.1f m/s^2 of braking to avoid it (>= %.2f m/s^2, %s DRAC threshold)"
+                           % (drac_max, S.drac_mps2[lvl_d - 1], SEVERITY_LEVELS[lvl_d]))
         if braked:
             reasons.append("The %s braked at %.1f m/s^2 toward a stopped road user" % braked)
         if below_3ft:
@@ -314,6 +344,9 @@ def _analyze_pair(A: Track, B: Track, kind: str, S: Settings, dt: float, dropped
                 "severity_level": level,
                 "severity_from_ttc": SEVERITY_LEVELS[lvl_t],
                 "severity_from_proximity": SEVERITY_LEVELS[lvl_p],
+                "drac_max_mps2": round(drac_max, 2) if drac_max else None,
+                "severity_from_drac": SEVERITY_LEVELS[lvl_d],
+                "severity_from_pet": "none",
                 "reasons": reasons,
                 "merged_duplicates": 0,
                 "_tracks": (A, B),
@@ -359,6 +392,69 @@ def _dedupe(events: List[Dict], S: Settings) -> List[Dict]:
     return kept
 
 
+def _pet_reason(pet: float, lvl: int, S: Settings) -> str:
+    return ("Crossing paths: the second road user reached the crossing point %.1f s after the first left it "
+            "(<= %.1f s, %s PET threshold)" % (pet, S.pet_s[lvl - 1], SEVERITY_LEVELS[lvl]))
+
+
+def _pet_events(tracks: List[Track], S: Settings, events: List[Dict]) -> List[Dict]:
+    """PET flagging. Existing events whose PET is worse than their other indicators are upgraded; crossing pairs with
+    a short PET but no other flag become new events. Pairs are pre-filtered by time and by where their paths run,
+    so only pairs that could cross within the PET window are measured."""
+    dt = 1.0 / S.analysis_hz
+    cand = S.pet_s[0]
+    by_pair = {}
+    for e in events:
+        by_pair.setdefault(frozenset((e["a"]["track"], e["b"]["track"])), []).append(e)
+        if e.get("pet_s") is not None:
+            lvl = _level(e["pet_s"], S.pet_s)
+            e["severity_from_pet"] = SEVERITY_LEVELS[lvl]
+            if lvl > e["severity_level"]:
+                e["severity_level"], e["severity"] = lvl, SEVERITY_LEVELS[lvl]
+            if lvl:
+                e["reasons"].append(_pet_reason(e["pet_s"], lvl, S))
+    boxes = [(t.xy.min(axis=0), t.xy.max(axis=0)) for t in tracks]
+    new: List[Dict] = []
+    for i, A in enumerate(tracks):
+        for j in range(i + 1, len(tracks)):
+            B = tracks[j]
+            kind = pair_kind(A.group, B.group)
+            if kind is None or A.id == B.id or frozenset((A.id, B.id)) in by_pair:
+                continue
+            if A.k0 * dt > B.k1 * dt + cand or B.k0 * dt > A.k1 * dt + cand:
+                continue                                # one left the scene too long before the other arrived
+            R = S.collision_radius_m[kind]
+            (alo, ahi), (blo, bhi) = boxes[i], boxes[j]
+            if (alo > bhi + R).any() or (blo > ahi + R).any():
+                continue                                # their paths never come near each other
+            det = pet_details(A, B, R)
+            if det is None or det["pet"] > cand:
+                continue
+            ia, jb = det["i"], det["j"]
+            spA, spB = float(A.speed[ia]), float(B.speed[jb])
+            veh_speed = max(spA, spB) if kind == "veh-veh" else (spA if A.group == "veh" else spB)
+            if veh_speed < S.min_vehicle_speed_mps:
+                continue
+            lvl = _level(det["pet"], S.pet_s)
+            a_first = A.group == "veh" if kind != "veh-veh" else spA >= spB
+            X, Y, spX, spY = (A, B, spA, spB) if a_first else (B, A, spB, spA)
+            new.append({
+                "kind": kind, "kind_label": KIND_LABEL[kind],
+                "a": {"track": X.id, "seg": X.seg, "cls": X.cls, "speed_mps": round(spX, 2)},
+                "b": {"track": Y.id, "seg": Y.seg, "cls": Y.cls, "speed_mps": round(spY, 2)},
+                "t_start": round(det["t_start"], 2), "t_peak": round(det["t_second_in"], 2),
+                "t_end": round(det["t_end"], 2), "ttc_min_s": None, "d_min_m": round(det["path_gap_m"], 2),
+                "d_flag_m": None, "closing_speed_mps": 0.0, "pet_s": round(det["pet"], 2), "same_direction": False,
+                "clearance_est_m": None, "below_3ft": None,
+                "x": round(float(det["P"][0]), 2), "y": round(float(det["P"][1]), 2),
+                "severity": SEVERITY_LEVELS[lvl], "severity_level": lvl, "severity_from_ttc": "none",
+                "severity_from_proximity": "none", "drac_max_mps2": None, "severity_from_drac": "none",
+                "severity_from_pet": SEVERITY_LEVELS[lvl], "flag_source": "pet",
+                "reasons": [_pet_reason(det["pet"], lvl, S)], "merged_duplicates": 0,
+            })
+    return new
+
+
 def detect_conflicts(tracks: List[Track], S: Settings, stats: Optional[Dict] = None) -> List[Dict]:
     """Flagged events. If `stats` is given, it receives counts of candidate flags each filter removed."""
     dt = 1.0 / S.analysis_hz
@@ -380,10 +476,14 @@ def detect_conflicts(tracks: List[Track], S: Settings, stats: Optional[Dict] = N
         stats.update({"filtered_" + k: v for k, v in dropped.items()})
     events = _dedupe(events, S)
     for e in events:
-        A, B = e.pop("_tracks")
+        A, B = e["_tracks"]
         e["pet_s"] = post_encroachment_time(A, B, S.collision_radius_m[e["kind"]])
         if e["pet_s"] is not None:
             e["pet_s"] = round(e["pet_s"], 2)
+    if S.pet_flagging:
+        events += _pet_events(tracks, S, events)
+    for e in events:
+        e.pop("_tracks", None)
     events.sort(key=lambda e: e["t_peak"])
     for n, e in enumerate(events, 1):
         e["id"] = "E%03d" % n

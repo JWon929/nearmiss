@@ -22,7 +22,7 @@ import shutil
 import time
 import uuid
 import zipfile
-from dataclasses import replace
+from dataclasses import asdict, replace
 from html import escape as html_escape
 from pathlib import Path
 
@@ -31,13 +31,15 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+from detect_job import load_job, new_job, run_job
 from detector_tracker import (MODEL_CHOICES, VISDRONE_MODEL, RenderOptions, RoadUserTracker, TrackerSettings,
-                              aerial_choices, auto_stride, finds_people, pick_device)
+                              aerial_choices, auto_stride, device_label, finds_people, intel_devices, pick_device)
 from engine import demo, design, review_pack, validation
 from engine.analysis import (analyze, build_report_html, cut_clip, distance_series, event_frame, events_table,
                              load_tracker_csv, topdown_map)
-from engine.calibration import Calibration, CalibrationError
-from engine.config import KIND_LABEL, SEVERITY_LEVELS, Settings
+from engine.calibration import Calibration, CalibrationError, fit_scale
+from engine.config import (KIND_LABEL, PRESET_NOTES, PRESETS, SEVERITY_LEVELS, Settings, apply_preset,
+                           matching_preset)
 from engine.conflicts import ENCOUNTER_PAD_S
 from engine.insights import (MPS_TO_MPH, explain_event, sensitivity, speed_summary, tuning_curve,
                              vehicle_size_check)
@@ -463,11 +465,12 @@ def trash_ui() -> None:
 
 
 def clean_interrupted() -> int:
-    """Folders left by a detection that was stopped or crashed (no meta.json) and are older than 10 minutes."""
+    """Folders left by a detection that was stopped or crashed (no meta.json), older than 10 minutes, that cannot be
+    resumed. Ones with a checkpoint (partial/job.json) are kept and offered on Detect."""
     n = 0
     for p in RUNS.iterdir():
         if p.is_dir() and not p.name.startswith(".") and not (p / "meta.json").exists() \
-                and time.time() - p.stat().st_mtime > 600:
+                and load_job(p) is None and time.time() - p.stat().st_mtime > 600:
             shutil.rmtree(p, ignore_errors=True)
             n += 1
     return n
@@ -652,7 +655,10 @@ def page_detect():
                 "Upload an intersection clip. Works best from a camera that stays still (tripod, pole, hovering "
                 "drone). If the camera drifts or zooms, NearMiss lines every frame up with the first one.")
     damaged_files_ui()
-    up = st.file_uploader("Intersection video", type=["mp4", "mov", "m4v"])
+    prewarm_detector()
+    unfinished_ui()
+    ups = st.file_uploader("Intersection video(s)", type=["mp4", "mov", "m4v"], accept_multiple_files=True,
+                           help="Choose several clips to process them one after another, each as its own recording.")
     view = st.radio("How was it filmed?", ["angled", "overhead"], horizontal=True, key="det_view",
                     format_func=lambda v: {"angled": "From the side or a pole (looking at the road at an angle)",
                                            "overhead": "From above (drone looking straight down)"}[v])
@@ -674,7 +680,11 @@ def page_detect():
     imgsz = c2.select_slider("Detection size (px)", [640, 800, 960, 1280], value=960,
                              help="Bigger finds smaller or farther road users but is slower. "
                                   "For overhead models 960 works best: bigger sizes start calling cars 'large vehicles'.")
-    device = c3.selectbox("Device", ["auto", "cpu", "mps", "cuda:0"], help="auto picks an Apple chip (mps) or GPU if present.")
+    devices = ["auto", "cpu"] + [f"intel:{d.lower()}" for d in ("GPU", "NPU") if d in intel_devices()] + ["mps", "cuda:0"]
+    device = c3.selectbox("Device", devices, format_func=lambda d: f"auto ({device_label(pick_device('auto'))})"
+                          if d == "auto" else device_label(d),
+                          help="auto picks the fastest one found: an NVIDIA GPU, an Apple chip, or an Intel GPU "
+                               "(through OpenVINO, about 4x faster than the CPU on an Intel Arc laptop chip).")
     with st.expander("More settings"):
         a, b, c = st.columns(3)
         high = a.slider("Detection confidence", 0.10, 0.60, 0.25, 0.05,
@@ -700,117 +710,265 @@ def page_detect():
         if not blur:
             st.warning("Blur is off: the videos this run makes will show faces and plates. Do not share them.")
 
-    if up is None:
+    if not ups:
         return
-    tmp = RUNS / ".incoming"
-    tmp.mkdir(exist_ok=True)
-    src_tmp = tmp / "upload.mp4"
-    src_tmp.write_bytes(up.getbuffer())
-    try:
-        m = read_metadata(str(src_tmp))
-    except ValueError as e:
-        st.error(f"{e} If it plays elsewhere, the codec may be unsupported (HEVC from some phones): re-export it as "
-                 "H.264 MP4 and upload it again.")
+    files = []                                       # (upload, saved path, metadata)
+    for up in ups:
+        path = save_upload(up)
+        try:
+            files.append((up, path, read_metadata(str(path))))
+        except ValueError as e:
+            st.error(f"{up.name}: {e} If it plays elsewhere, the codec may be unsupported (HEVC from some phones): "
+                     "re-export it as H.264 MP4 and upload it again.")
+    if not files:
         return
+    up, src_tmp, m = files[0]
     stride = auto_stride(m["fps"]) if stride_auto else 1
-    kpis([("Duration", f"{m['duration_s']} s"), ("FPS", m["fps"]), ("Resolution", f"{m['width']}x{m['height']}"),
-          ("Frames", m["frame_count"]), ("Analysed", f"every {stride} frame(s)"), ("Device", pick_device(device))])
-    ts = TrackerSettings(model_name=model, imgsz=imgsz, high_conf=high, start_conf=start, track_buffer_s=buffer_s,
-                         stride=stride, device=device, coast_s=coast, trail_s=trail, stabilize=stabilize)
-    ro = RenderOptions(blur_privacy=blur, privacy_level=level, show_trails=trail > 0, show_confidence=conf_show)
+    dev = pick_device(device)
+    if len(files) == 1:
+        kpis([("Duration", f"{m['duration_s']} s"), ("FPS", m["fps"]), ("Resolution", f"{m['width']}x{m['height']}"),
+              ("Frames", m["frame_count"]), ("Analysed", f"every {stride} frame(s)"), ("Device", device_label(dev))])
+    else:
+        st.dataframe(pd.DataFrame([{"clip": u.name, "duration (s)": mm["duration_s"], "fps": mm["fps"],
+                                    "resolution": f"{mm['width']}x{mm['height']}"} for u, _, mm in files]),
+                     hide_index=True, width="stretch")
+        st.caption(f"{len(files)} clips, {sum(mm['duration_s'] for _, _, mm in files) / 60:.1f} min in total. They run "
+                   f"one after another with the same settings, on {device_label(dev)}; each becomes its own recording.")
+    if dev == "cpu" and "GPU" not in intel_devices():
+        st.caption("Running on the CPU. On a computer with an NVIDIA, Apple or Intel graphics chip, detection is several "
+                   "times faster (Intel needs `pip install openvino`).")
+
+    def settings_for(mm):
+        st_ = auto_stride(mm["fps"]) if stride_auto else 1
+        return (TrackerSettings(model_name=model, imgsz=imgsz, high_conf=high, start_conf=start,
+                                track_buffer_s=buffer_s, stride=st_, device=device, coast_s=coast, trail_s=trail,
+                                stabilize=stabilize),
+                RenderOptions(blur_privacy=blur, privacy_level=level, show_trails=trail > 0, show_confidence=conf_show))
+
     a, b = st.columns([1, 3])
     test = a.button("Try on the first 10 s", icon=":material/science:",
                     help="Quick check of the model and settings before the full run. Nothing is saved.")
-    run = b.button("Run detection + tracking", type="primary")
+    run = b.button("Run detection + tracking" if len(files) == 1 else f"Run all {len(files)} clips", type="primary")
     if test:
-        quick_test(str(src_tmp), m, ts, ro)
+        quick_test(str(src_tmp), m, *settings_for(m))
+    compare_models_ui(str(src_tmp), m, choices, model, imgsz, device, stabilize)
     if not run:
         return
+    queued = []
+    for u, path, mm in files:
+        ts, ro = settings_for(mm)
+        queued.append(start_job(u.name, path, mm, ts, ro, view, blur, level))
+    st.button("Stop processing", icon=":material/stop_circle:",
+              help="Stops detection. Finished 30-second parts are kept, so you can resume it later from this page.")
+    done = []
+    for k, run_id in enumerate(queued):
+        if len(queued) > 1:
+            st.subheader(f"Clip {k + 1} of {len(queued)}: {load_job(run_dir(run_id))['name']}", anchor=False)
+        job = process_job_ui(run_id)
+        if job is not None:
+            done.append((run_id, job))
+    if len(done) == 1:
+        after_run_ui(*done[0])
+    elif done:
+        st.success(f"Finished {len(done)} of {len(queued)} recordings. Pick one in the sidebar to calibrate it.")
+        st.dataframe(pd.DataFrame([{"recording": j["name"], "detections": j["rows"], "minutes taken":
+                                    round(j["seconds"] / 60, 1)} for _, j in done]), hide_index=True, width="stretch")
+        st.session_state["rid"] = done[0][0]
 
+
+def compare_models_ui(path: str, m: dict, choices: dict, current: str, imgsz: int, device: str,
+                      stabilize: bool) -> None:
+    """Run two detection models on the first seconds of this clip and compare what they find (tools/compare_models.py
+    on the command line). There is no answer key, so these are clues, not accuracy: look at the two pictures."""
+    with st.expander("Compare two models on this clip", icon=":material/compare:"):
+        st.caption("Runs both models on the start of the clip with the same settings. More road users is better only "
+                   "if they are real: check the two pictures. Nothing is saved.")
+        names = list(choices)
+        a, b, c = st.columns([2, 2, 1])
+        m1 = a.selectbox("Model A", names, index=names.index(current), key="cmp_a",
+                         format_func=lambda x: f"{x} ({choices[x]})")
+        m2 = b.selectbox("Model B", names, index=(names.index(current) + 1) % len(names), key="cmp_b",
+                         format_func=lambda x: f"{x} ({choices[x]})")
+        secs = c.number_input("Seconds", 5, 120, 20, 5, key="cmp_s")
+        if not st.button("Compare", icon=":material/compare_arrows:", disabled=m1 == m2):
+            return
+        from tools.compare_models import evaluate
+
+        rows = []
+        for mdl in (m1, m2):
+            bar = st.progress(0.0, text=f"Running {mdl}...")
+            try:
+                rows.append(evaluate(mdl, path, float(secs), float(secs) / 2, device=device, stabilize=stabilize,
+                                     imgsz=imgsz, blur=True, progress=lambda f: bar.progress(f, text=f"Running {mdl}...")))
+            except Exception as e:
+                st.error(model_error(mdl, e))
+            bar.empty()
+        if not rows:
+            return
+        st.dataframe(pd.DataFrame([{"model": r["model"], "tracks of 1 s or more": r["tracks_1s"],
+                                    "moving tracks": r["moving_tracks"], "label switches": r["label_switches"],
+                                    "road users per frame": ", ".join(f"{v} {k}" for k, v in r["per_frame"].items()),
+                                    "speed": f"{r['ms_per_frame']} ms/frame on {device_label(r['device'])}"}
+                                   for r in rows]), hide_index=True, width="stretch")
+        st.caption("*Moving tracks* travel more than 3 car lengths: conflicts come from those. *Label switches* count "
+                   "car/truck flicker: fewer is steadier.")
+        cols = st.columns(len(rows))
+        for col, r in zip(cols, rows):
+            if r["snapshot"] is not None:
+                col.image(rgb(r["snapshot"]), width="stretch", caption=f"{r['model']} at {secs / 2:.0f} s (blurred)")
+            if r["warning"]:
+                col.warning(r["warning"])
+
+
+def save_upload(up) -> Path:
+    """Copy an uploaded clip to disk once. Streamlit re-runs the page on every click; re-writing a 2 GB upload each
+    time used to cost seconds per click."""
+    tmp = RUNS / ".incoming"
+    tmp.mkdir(exist_ok=True)
+    path = tmp / f"upload_{abs(hash((up.name, up.size))) % 10 ** 10}.mp4"
+    if not path.exists() or path.stat().st_size != up.size:
+        with open(path, "wb") as f:
+            shutil.copyfileobj(up, f, length=16 * 1024 * 1024)
+        up.seek(0)
+    return path
+
+
+@st.cache_resource
+def prewarm_detector():
+    """Import the detection libraries in the background while the user picks a clip and settings, once per app
+    start: PyTorch and Ultralytics take 5-10 s to import, which used to be paid after pressing Run."""
+    import threading
+
+    def load():
+        try:
+            import ultralytics  # noqa: F401
+            from ultralytics.trackers import byte_tracker  # noqa: F401
+        except Exception:
+            pass
+
+    t = threading.Thread(target=load, daemon=True)
+    t.start()
+    return t
+
+
+def start_job(name: str, upload_path: Path, m: dict, ts: TrackerSettings, ro: RenderOptions, view: str,
+              blur: bool, level: str) -> str:
+    """A new run folder with the video and a checkpointed job, ready for process_job_ui."""
     new_id = time.strftime("%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4]
     d = run_dir(new_id)
     d.mkdir(parents=True)
-    src = d / "source.mp4"
-    shutil.copy(str(src_tmp), str(src))          # keep the upload until the run finishes, so a stop loses nothing
-    st.button("Stop processing", icon=":material/stop_circle:",
-              help="Stops detection. Nothing is saved; the uploaded clip stays ready to run again.")
-    prog = st.progress(0.0, text="Loading model...")
-    try:
-        tracker = RoadUserTracker(ts, ro)
-    except Exception as e:
-        shutil.rmtree(d, ignore_errors=True)
-        st.error(model_error(model, e))
-        return
-    writer = AnnotatedVideoWriter(str(d / "annotated.mp4"), m["fps"] / stride)
+    shutil.copy(str(upload_path), str(d / "source.mp4"))   # keep the upload until the run finishes
+    new_job(d, name=name, view=view, tracker=ts.to_dict(), render=asdict(ro),
+            meta=dict(m, privacy={"blur": bool(blur), "level": level if blur else "off"}))
+    return new_id
+
+
+def process_job_ui(run_id: str):
+    """Run (or resume) one job with a progress bar and a live preview. Returns the finished job, or None."""
+    d = run_dir(run_id)
+    job = load_job(d)
+    resumed = job["next_frame"] > 0
+    prog = st.progress(job["next_frame"] / max(job["meta"]["frame_count"], 1),
+                       text="Loading model..." if not resumed else "Loading model to resume...")
     preview = st.empty()
-    rows = []
-    t0 = time.time()
-    n = 0
 
-    def progress(i: int, tot: int) -> None:
-        done = min(i / max(tot, 1), 1.0)
-        took = time.time() - t0
+    def progress(i: int, tot: int, left: float) -> None:
         text = f"Frame {i}/{tot}"
-        if done > 0.02 and took > 3:            # the first frames include model warm-up, so wait before estimating
-            left = took * (1 - done) / done
+        if left >= 0:
             text += f" · about {left / 60:.0f} min left" if left >= 90 else f" · about {left:.0f} s left"
-        prog.progress(done, text=text)
+        prog.progress(min(i / max(tot, 1), 1.0), text=text)
 
     try:
-        for res in tracker.process_video(str(src), m["fps"], progress):
-            writer.write(res.annotated)
-            for x in res.detections:
-                rows.append([x.frame, f"{x.time_s:.4f}", x.track_id, x.class_name, f"{x.confidence:.3f}",
-                             f"{x.x1:.1f}", f"{x.y1:.1f}", f"{x.x2:.1f}", f"{x.y2:.1f}",
-                             f"{(x.x1 + x.x2) / 2:.1f}", f"{(x.y1 + x.y2) / 2:.1f}"])
-            n += 1
-            if n % 5 == 0:
-                preview.image(rgb(res.annotated), channels="RGB", width="stretch")
+        job = run_job(d, progress, lambda img: preview.image(rgb(img), channels="RGB", width="stretch"))
     except Exception as e:
-        writer.release()
-        shutil.rmtree(d, ignore_errors=True)
-        st.error(f"Detection stopped at frame {n} ({type(e).__name__}: {e}). What to try: choose Device *cpu*, a "
-                 "smaller detection size, or re-export the video as H.264 MP4.")
-        return
-    except BaseException:                          # Stop button / page change: Streamlit interrupts the script here
-        writer.release()
-        shutil.rmtree(d, ignore_errors=True)
-        raise
-    writer.release()
-    if tracker.motion is not None:
-        write_json(d / "motion.json", tracker.motion.to_dict((m["width"], m["height"])))
+        st.error(f"Detection stopped ({type(e).__name__}: {e}). The finished parts are kept: resume it at the top of "
+                 "this page. What to try: choose Device *cpu*, a smaller detection size, or re-export the video as "
+                 "H.264 MP4.")
+        return None
+    prog.progress(1.0, text="Done")
+    preview.empty()
+    finish_run(run_id, job)
+    return job
+
+
+def finish_run(run_id: str, job: dict) -> None:
+    """settings.json and meta.json for a finished detection (meta.json last: without it a run is unfinished)."""
+    d = run_dir(run_id)
     S = Settings()
-    if overhead:
+    if job["view"] == "overhead":
         S.ground_point = "center"
         S.privacy_level = "strict"
     write_json(d / "settings.json", S.to_dict())
-    with open(d / "detections.csv", "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(CSV_HEADER)
-        w.writerows(rows)
-    m.update(name=up.name, created=time.time(), synthetic=False, stride=stride, settings=ts.to_dict(),
-             codec=writer.codec, seconds=round(time.time() - t0, 1), detection_rows=len(rows),
-             model_used=tracker.model_used, device_used=tracker.device_used, view=view,
-             privacy={"blur": bool(blur), "level": level if blur else "off"})
-    write_json(d / "meta.json", m)                # written last: a folder without it is an unfinished run
-    src_tmp.unlink(missing_ok=True)
-    st.session_state["rid"] = new_id
-    prog.progress(1.0, text="Done")
-    if n == 0:
+    m = dict(job["meta"])
+    m.update(name=job["name"], created=time.time(), synthetic=False, stride=job["tracker"]["stride"],
+             settings=job["tracker"], codec=job.get("codec") or "", seconds=job["seconds"], detection_rows=job["rows"],
+             model_used=job["model_used"], device_used=job["device_used"], view=job["view"],
+             resumed=job.get("resumes", 0))
+    write_json(d / "meta.json", m)
+    for p in (RUNS / ".incoming").glob("upload_*.mp4"):
+        if p.stat().st_size == (d / "source.mp4").stat().st_size:
+            p.unlink(missing_ok=True)
+
+
+def unfinished_ui() -> None:
+    """Detections that were stopped or crashed, with their progress: resume or discard each."""
+    for msg in st.session_state.pop("_resumed_msgs", []):
+        st.success(msg)
+    jobs = [(p.name, load_job(p)) for p in sorted(RUNS.iterdir()) if p.is_dir() and not (p / "meta.json").exists()]
+    jobs = [(r, j) for r, j in jobs if j]
+    if not jobs:
+        return
+    with st.container(border=True):
+        st.markdown(f":material/pause_circle: **{len(jobs)} unfinished detection(s)**. Finished parts were kept.")
+        for r, j in jobs:
+            pct = j["next_frame"] / max(j["meta"]["frame_count"], 1)
+            a, b, c = st.columns([4, 1, 1])
+            a.markdown(f"**{j['name']}** · {pct:.0%} done · {j['meta']['duration_s'] * pct / 60:.1f} of "
+                       f"{j['meta']['duration_s'] / 60:.1f} min")
+            if b.button("Resume", key=f"resume_{r}", type="primary", width="stretch"):
+                st.session_state["_resume"] = [r]
+            if c.button("Discard", key=f"discard_{r}", width="stretch"):
+                shutil.rmtree(run_dir(r), ignore_errors=True)
+                st.rerun()
+        if len(jobs) > 1 and st.button("Resume all", icon=":material/play_arrow:"):
+            st.session_state["_resume"] = [r for r, _ in jobs]
+        todo = st.session_state.pop("_resume", None)
+        if todo:
+            st.button("Stop processing", icon=":material/stop_circle:", key="stop_resume")
+            msgs = []
+            for r in todo:
+                st.write(f"Resuming **{load_job(run_dir(r))['name']}**")
+                job = process_job_ui(r)
+                if job is None:
+                    return                             # the error is shown; the job stays listed for another try
+                msgs.append(f"{job['name']}: finished, {job['rows']} detections. It is now selected in the sidebar.")
+                st.session_state["rid"] = r
+            st.session_state["_resumed_msgs"] = msgs
+            st.rerun()                                 # redraw without the finished ones in the list
+
+
+def after_run_ui(run_id: str, job: dict) -> None:
+    """Messages after one finished detection: what was found, and what to check."""
+    d = run_dir(run_id)
+    m = read_json(d / "meta.json", {})
+    st.session_state["rid"] = run_id
+    frames = job.get("stats", {}).get("frames", 0)
+    if frames == 0:
         st.error("No frames could be read from this video. Try re-exporting it as H.264 MP4 (for example with "
                  "HandBrake or your phone's share/export option) and upload it again.")
-    elif not rows:
-        st.error(f"The model ran on {n} frames but found **no road users**, so there is nothing to analyse. Things to "
-                 "try: check *How was it filmed?* matches the footage (drone footage needs *From above*), lower "
-                 "*Detection confidence* under More settings, or raise *Detection size*.")
+    elif job["rows"] == 0:
+        st.error(f"The model ran on {frames} frames but found **no road users**, so there is nothing to analyse. "
+                 "Things to try: check *How was it filmed?* matches the footage (drone footage needs *From above*), "
+                 "lower *Detection confidence* under More settings, or raise *Detection size*.")
     else:
-        st.success(f"Processed {n} frames in {m['seconds']} s. {len(rows)} detections saved.")
-    if tracker.warning:
-        st.warning(tracker.warning)
+        st.success(f"Processed {frames} frames in {job['seconds']:.0f} s on {device_label(job['device_used'])}. "
+                   f"{job['rows']} detections saved." + (f" (Resumed {job['resumes']} time(s).)" if job.get("resumes") else ""))
+    if job.get("warning"):
+        st.warning(job["warning"])
     if blind_spot(m):
         st.warning("Vehicles only: pedestrian and bicycle conflicts are **not measured** in this recording.")
-    if tracker.motion is not None:
-        ms = tracker.motion.summary((m["width"], m["height"]))
+    ms = job.get("motion_summary")
+    if ms:
         if ms["max_shift_px"] < 3:
             st.caption("The camera stayed still.")
         else:
@@ -819,10 +977,11 @@ def page_detect():
         if ms["lost_frames"]:
             st.warning(f"{ms['lost_frames']} frames could not be lined up (too little texture or too much change). "
                        "Positions on those frames are less reliable.")
-    if writer.codec != "h264":
+    if job.get("codec") and job["codec"] != "h264":
         st.warning("ffmpeg was not found, so the video uses a format some browsers cannot play. "
                    "Run `pip install imageio-ffmpeg`, or open the file in VLC.")
-    st.video(str(d / "annotated.mp4"))
+    if (d / "annotated.mp4").exists():
+        st.video(str(d / "annotated.mp4"))
     st.download_button("Download detections.csv", (d / "detections.csv").read_bytes(), "detections.csv", "text/csv")
     st.write("Next, calibrate so distances and speeds are in metres.")
     next_button("Calibrate", "Calibrate")
@@ -1145,26 +1304,74 @@ def page_calibrate():
     a1.image(rgb(cal.preview(frame)), caption="Bird's-eye view of the road. Straight lines should look straight and "
              "lane edges parallel.", width="stretch")
     with b1:
-        st.write("**Accuracy check.** Choose *Accuracy-check points* above, click the two ends of a second known "
-                 "distance (for example a lane width), and type its real length.")
-        known = st.number_input("Known distance (m)", 0.5, 500.0, 3.5, 0.1)
-        if len(chk) == 2:
-            try:
-                est = cal.distance_between(chk[0], chk[1])
-            except CalibrationError as e:
-                st.error(str(e))
-            else:
-                err = 100 * (est - known) / known
-                st.metric("Measured", f"{est:.2f} m", f"{err:+.1f}% vs {known} m", delta_color="off")
-                if abs(err) > 10:
-                    st.warning("More than 10% off. Re-click the calibration points more carefully, or use a larger shape.")
-                check = [{"known_m": known, "measured_m": round(est, 3), "error_pct": round(err, 1)}]
-                if d.get("checks") != check:
-                    d["checks"] = check
-                    write_json(run_dir(rid) / "calibration.json", d)
-                    st.rerun()
-        else:
-            st.caption(f"{len(chk)} of 2 check points placed.")
+        accuracy_check_ui(cal, d, chk, chk_key)
+
+
+def accuracy_check_ui(cal, d: dict, chk: list, chk_key: str) -> None:
+    """One or more known distances measured with the calibration. The pink pair being placed is the 'current' check;
+    'Keep it and add another' saves it so a new pair can be clicked. With two or more, the scale can be fitted to all
+    of them (least squares) and the leave-one-out error says how accurate distances really are."""
+    st.write("**Accuracy check.** Choose *Accuracy-check points* above, click the two ends of a second known "
+             "distance (for example a lane width), and type its real length. More distances give a better check.")
+    kept = [c for c in d.get("checks", []) if not c.get("current")]
+    known = st.number_input("Known distance (m)", 0.5, 500.0, 3.5, 0.1, key=f"known_{rid}")
+    if len(chk) == 2:
+        try:
+            est = cal.distance_between(chk[0], chk[1])
+        except CalibrationError as e:
+            st.error(str(e))
+            return
+        err = 100 * (est - known) / known
+        st.metric("Measured", f"{est:.2f} m", f"{err:+.1f}% vs {known} m", delta_color="off")
+        if abs(err) > 10:
+            st.warning("More than 10% off. Re-click the calibration points more carefully, or use a larger shape.")
+        cur = {"known_m": known, "measured_m": round(est, 3), "error_pct": round(err, 1), "p1": chk[0], "p2": chk[1],
+               "current": True}
+        checks = [cur] + kept
+        if d.get("checks") != checks:
+            d["checks"] = checks
+            write_json(run_dir(rid) / "calibration.json", d)
+            st.rerun()
+        if st.button("Keep it and add another distance", icon=":material/add:"):
+            cur.pop("current")
+            write_json(run_dir(rid) / "calibration.json", d)
+            st.session_state[chk_key] = []
+            st.rerun()
+    else:
+        st.caption(f"{len(chk)} of 2 check points placed.")
+    all_checks = [c for c in d.get("checks", []) if "p1" in c]
+    if len(d.get("checks", [])) > 1:
+        st.dataframe(pd.DataFrame([{"known (m)": c["known_m"], "measured (m)": c["measured_m"],
+                                    "error": f"{c['error_pct']:+.1f}%", "": "being placed" if c.get("current") else ""}
+                                   for c in d["checks"]]), hide_index=True, width="stretch")
+        if st.button("Remove the kept distances"):
+            d["checks"] = [c for c in d["checks"] if c.get("current")]
+            write_json(run_dir(rid) / "calibration.json", d)
+            st.rerun()
+    if len(all_checks) >= 2:
+        fit = fit_scale(cal, all_checks)
+        loo = fit["rms_leave_one_out_pct"]
+        st.caption(f"Fitting the scale to all {fit['n']} distances would multiply distances by {fit['scale']:.3f}: typical "
+                   f"error {fit['rms_before_pct']:.1f}% now, {fit['rms_after_pct']:.1f}% after"
+                   + (f"; tested on each distance left out of the fit, {loo:.1f}% (the honest estimate)." if loo is not None
+                      else ". With 3 or more distances the app can also test the fit on each one left out."))
+        if abs(fit["scale"] - 1) > 0.005 and st.button("Apply the fitted scale", icon=":material/straighten:"):
+            new = cal.rescaled(fit["scale"])
+            nd = new.to_dict()
+            nd["input"] = d.get("input", {})
+            nd["scale_fit"] = {k: fit[k] for k in ("scale", "n", "rms_before_pct", "rms_after_pct",
+                                                    "rms_leave_one_out_pct")}
+            nd["checks"] = []
+            for c in d["checks"]:
+                if "p1" in c:
+                    m_ = new.distance_between(c["p1"], c["p2"])
+                    nd["checks"].append(dict(c, measured_m=round(m_, 3),
+                                             error_pct=round(100 * (m_ - c["known_m"]) / c["known_m"], 1)))
+            write_json(run_dir(rid) / "calibration.json", nd)
+            st.rerun()
+    if d.get("scale_fit"):
+        sf = d["scale_fit"]
+        st.caption(f"Scale fitted to {sf['n']} known distances (x{sf['scale']:.3f}).")
 
 
 # ================================================================== RESULTS
@@ -1172,6 +1379,17 @@ def thresholds_ui(S: Settings) -> None:
     with st.container(border=True):
         st.subheader("Thresholds", anchor=False)
         st.caption("Defaults are starting points for screening, not safety standards. Validate them on your own clips.")
+        now = matching_preset(S)
+        a, b = st.columns([3, 1])
+        pick = a.selectbox("Start from a preset for this kind of site", list(PRESETS),
+                           index=list(PRESETS).index(now) if now else 0, key=f"preset_pick_{rid}",
+                           help="Changes only the conflict thresholds. Check the result on your labelled events "
+                                "(Report > Tuning) before relying on it.")
+        st.caption(PRESET_NOTES[pick] + ("" if now else " Your current thresholds were changed by hand."))
+        b.write("")
+        if b.button("Apply preset", disabled=pick == now, width="stretch"):
+            write_json(run_dir(rid) / "settings.json", apply_preset(S, pick).to_dict())
+            st.rerun()
         a, b, c = st.columns(3)
         S.ttc_candidate_s = a.slider("Candidate if TTC under (s)", 1.0, 6.0, S.ttc_candidate_s, 0.5)
         S.ttc_moderate_s = b.slider("Moderate if TTC under (s)", 0.5, 4.0, S.ttc_moderate_s, 0.5)
@@ -1179,6 +1397,23 @@ def thresholds_ui(S: Settings) -> None:
         a, b = st.columns(2)
         S.min_vehicle_speed_mps = a.slider("Ignore vehicles slower than (m/s)", 0.0, 5.0, S.min_vehicle_speed_mps, 0.5)
         S.min_track_s = b.slider("Ignore tracks shorter than (s)", 0.5, 4.0, S.min_track_s, 0.5)
+        st.markdown("**Extra indicators** (off by default: turn on, then check them against your labelled events)")
+        a, b = st.columns(2)
+        S.pet_flagging = a.toggle("Flag crossing paths by PET", S.pet_flagging,
+                                  help="Post-encroachment time: how soon the second road user reached a crossing point "
+                                       "after the first one left it. Catches near misses where the two were never on a "
+                                       "collision course at the same moment, which TTC cannot see.")
+        if S.pet_flagging:
+            S.pet_s = list(a.slider("PET candidate / serious (s)", 0.5, 5.0, (S.pet_s[2], S.pet_s[0]), 0.5))[::-1]
+            S.pet_s = [S.pet_s[0], round((S.pet_s[0] + S.pet_s[1]) / 2, 2), S.pet_s[1]]
+        S.drac_flagging = b.toggle("Flag by required braking (DRAC)", S.drac_flagging,
+                                   help="Deceleration rate to avoid the crash: the braking either road user would have "
+                                        "needed. Always shown on each event; this also lets it raise the severity. "
+                                        "3.35 m/s² is the usual line (comfortable braking).")
+        if S.drac_flagging:
+            S.drac_mps2 = list(b.slider("DRAC candidate / serious (m/s²)", 1.0, 9.0,
+                                        (S.drac_mps2[0], S.drac_mps2[2]), 0.25))
+            S.drac_mps2 = [S.drac_mps2[0], round((S.drac_mps2[0] + S.drac_mps2[1]) / 2, 2), S.drac_mps2[1]]
         ok = S.ttc_serious_s < S.ttc_moderate_s < S.ttc_candidate_s
         if not ok:
             st.error("TTC thresholds must go serious < moderate < candidate.")
@@ -1729,6 +1964,36 @@ def missed_ui() -> None:
                 st.rerun()
 
 
+def distance_chart(tracks, ev) -> None:
+    """Separation over time with a line at the frame shown in *Step through frames*; clicking the chart moves the
+    frame there."""
+    import altair as alt
+
+    ds = distance_series(tracks, ev)
+    if not ds["t"]:
+        return
+    tkey = f"tstep_{rid}_{ev['key']}"
+    now = float(st.session_state.get(tkey, ev["t_peak"]))
+    df = pd.DataFrame({"t": ds["t"], "distance": ds["distance_m"]})
+    pick = alt.selection_point(fields=["t"], nearest=True, on="click", name="pick")
+    line = alt.Chart(df).mark_line(point=alt.OverlayMarkDef(size=18, opacity=0.4)).encode(
+        x=alt.X("t:Q", title="time in the video (s)", scale=alt.Scale(zero=False)),
+        y=alt.Y("distance:Q", title="distance between them (m)", scale=alt.Scale(zero=True)),
+        tooltip=[alt.Tooltip("t:Q", format=".1f"), alt.Tooltip("distance:Q", format=".2f")]).add_params(pick)
+    rule = alt.Chart(pd.DataFrame({"t": [now]})).mark_rule(color="#c62828", strokeWidth=2).encode(x="t:Q")
+    low = df.loc[[int(df["distance"].idxmin())]]
+    dot = alt.Chart(low).mark_point(color="#c62828", size=70, filled=True).encode(x="t:Q", y="distance:Q")
+    got = st.altair_chart((line + rule + dot).properties(height=170), width="stretch", on_select="rerun",
+                          key=f"dchart_{rid}_{ev['key']}")
+    pts = (got or {}).get("selection", {}).get("pick") or []
+    if pts and "t" in pts[0] and abs(float(pts[0]["t"]) - now) > 1e-6:
+        st.session_state[f"_tjump_{rid}"] = (ev["key"], float(pts[0]["t"]))   # applied before the slider is drawn
+        st.rerun()
+    st.caption(f"Lowest point (red dot): {low['distance'].iloc[0]} m at {low['t'].iloc[0]} s, the same moment as "
+               f"*Closest*. The red line is the frame shown under *Step through frames* ({now:.1f} s); click the chart "
+               "to move it.")
+
+
 def review_player(det, S, tracks, ev) -> None:
     """One large player: the looping clip, or step through the frames with the two road users emphasised."""
     tabs = st.tabs([":material/play_circle: Clip", ":material/frame_inspect: Step through frames"])
@@ -1753,6 +2018,9 @@ def review_player(det, S, tracks, ev) -> None:
         tkey = f"tstep_{rid}_{ev['key']}"
         if tkey not in st.session_state:
             st.session_state[tkey] = float(round(ev["t_peak"], 1))
+        jump = st.session_state.pop(f"_tjump_{rid}", None)        # a click on the distance chart
+        if jump and jump[0] == ev["key"]:
+            st.session_state[tkey] = float(min(hi, max(lo, round(jump[1], 1))))
         a, b, c, d = st.columns([1, 1, 1, 1])
         a.button("-0.1 s", key=f"tb_{tkey}", width="stretch",
                  on_click=lambda: st.session_state.__setitem__(tkey, round(max(lo, st.session_state[tkey] - 0.1), 1)))
@@ -1824,6 +2092,9 @@ def page_review():
                    ("PET", f"{ev['pet_s']} s" if ev["pet_s"] is not None else "n/a",
                     "Post-encroachment time: from the first one leaving the shared conflict point to the second one "
                     "reaching it."),
+                   ("Braking needed", f"{ev['drac_max_mps2']} m/s²" if ev.get("drac_max_mps2") else "n/a",
+                    "DRAC: the braking either road user would have needed to avoid the collision. Above 3.35 m/s² is "
+                    "harder than comfortable braking."),
                    ("Time", f"{ev['t_peak']} s", "Seconds into the video."),
                    ("Movements", ev["movements"], "Approach and turn of each road user."),
                    ("Phase", ev.get("phase") or "-", "Signal phase, if typed on Results.")])
@@ -1833,11 +2104,7 @@ def page_review():
         if ev.get("below_3ft"):
             st.warning("Estimated clearance is under 3 ft (0.91 m), the California passing rule for bikes.")
         st.caption("Why it was flagged: " + "; ".join(ev["reasons"]))
-        ds = distance_series(tracks, ev)
-        if ds["t"]:
-            st.line_chart(pd.DataFrame({"distance between them (m)": ds["distance_m"]}, index=ds["t"]), height=160)
-            st.caption(f"Lowest point: {min(ds['distance_m'])} m at {ds['t'][int(np.argmin(ds['distance_m']))]} s, the "
-                       "same moment as *Closest* and the picture.")
+        distance_chart(tracks, ev)
         st.write("**Was this a real near miss?**")
         note_key = f"note_{rid}_{ev['key']}"
         if note_key not in st.session_state:
@@ -2005,7 +2272,7 @@ def all_recordings_ui() -> None:
                "summed counts, not an average of percentages.")
     if not st.toggle("Compute it", key="all_val"):
         return
-    rows, summs = [], []
+    rows, summs, conds = [], [], []
     for r, label in list_runs():
         m = read_json(run_dir(r) / "meta.json", {}) or {}
         store, _ = load_labels(r)
@@ -2016,6 +2283,11 @@ def all_recordings_ui() -> None:
             continue
         s = x["summary"]
         summs.append(s)
+        info = read_json(run_dir(r) / "recording_info.json", {}) or {}
+        conds.append({"lighting": info.get("lighting") or "not recorded", "weather": info.get("weather") or "not recorded",
+                      "camera view": {"overhead": "drone", "angled": "street-level"}.get(m.get("view"), "unknown"),
+                      "camera": info.get("camera") or "not recorded", "detection model": m.get("model_used") or "?",
+                      "summary": s})
         rows.append({"recording": label, "flagged": s["events_flagged"], "real": s["tp"], "false alarms": s["fp"],
                      "unsure": s["unsure"], "not reviewed": s["unreviewed"], "missed": s["missed"],
                      "precision": "n/a" if s["precision"] is None else f"{s['precision']:.0%}"})
@@ -2028,6 +2300,29 @@ def all_recordings_ui() -> None:
     st.write(f"Total over {tot['recordings']} recording(s): {tot['events_flagged']} flagged, {tot['tp']} real, "
              f"{tot['fp']} false alarms, {tot['unreviewed']} not reviewed, {tot['missed']} missed. Precision "
              f"{pct(tot['precision'])}, recall at most {pct(tot['recall_upper_bound'])}.")
+    by_condition_ui(conds)
+
+
+def by_condition_ui(conds: list) -> None:
+    """Precision per recording condition (lighting, weather, view...): where the tool works and where it breaks."""
+    st.write("**By condition**")
+    dim = st.radio("Group recordings by", ["lighting", "weather", "camera view", "camera", "detection model"],
+                   horizontal=True, key="cond_dim")
+    groups = {}
+    for c in conds:
+        groups.setdefault(c[dim], []).append(c["summary"])
+    pct = lambda v: "n/a" if v is None else f"{v:.0%}"
+    rows = []
+    for value, ss in sorted(groups.items()):
+        t = validation.combine(ss)
+        rows.append({dim: value, "recordings": t["recordings"], "reviewed": t["tp"] + t["fp"], "real": t["tp"],
+                     "false alarms": t["fp"], "precision": pct(t["precision"]),
+                     "recall (at most)": pct(t["recall_upper_bound"])})
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    small = [r[dim] for r in rows if r["reviewed"] < 10]
+    st.caption("Fill in *Recording details* for each recording to group by lighting, weather or camera."
+               + (f" Fewer than 10 reviewed events in: {', '.join(map(str, small))}; their precision can swing a lot "
+                  "with one more label." if small else ""))
 
 
 def event_frames(det, S: Settings, events) -> dict:

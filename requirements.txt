@@ -9,3 +9,6 @@ imageio-ffmpeg==0.6.0
 pandas==3.0.6
 numpy==2.5.4
 pytest==9.1.1
+# Optional: runs detection on Intel graphics (Arc, Iris Xe) about 4x faster than the CPU. Harmless elsewhere; the app
+# works without it.
+openvino==2026.4.1

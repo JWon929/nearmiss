@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
+from typing import Callable, Optional
 
 import cv2
 import numpy as np
@@ -28,28 +30,36 @@ from engine.motion import to_reference  # noqa: E402
 from video_utils import read_metadata  # noqa: E402
 
 
-def evaluate(model: str, clip: str, seconds: float, snapshot_s: float, out: Path) -> dict:
+def evaluate(model: str, clip: str, seconds: float, snapshot_s: float, out: Optional[Path] = None,
+             device: str = "auto", stabilize: bool = True, imgsz: int = 960, blur: bool = False,
+             progress: Optional[Callable[[float], None]] = None) -> dict:
+    """Run one model on the first `seconds` of the clip. Also used by the app's model comparison (Detect page)."""
     meta = read_metadata(clip)
     stride = auto_stride(meta["fps"])
-    tracker = RoadUserTracker(TrackerSettings(model_name=model, stride=stride, stabilize=True),
-                              RenderOptions(blur_privacy=False, show_confidence=False))
+    tracker = RoadUserTracker(TrackerSettings(model_name=model, stride=stride, stabilize=stabilize, device=device,
+                                              imgsz=imgsz),
+                              RenderOptions(blur_privacy=blur, privacy_level="strict", show_confidence=False))
     per_class, frames = Counter(), 0
     seen = defaultdict(list)                      # track -> [(frame, class, x, y)]
-    snap_saved = False
+    snap = None
+    t0 = time.perf_counter()
     for res in tracker.process_video(clip, meta["fps"]):
         if res.time_s > seconds:
             break
         frames += 1
+        if progress:
+            progress(min(res.time_s / seconds, 1.0))
         for d in res.detections:
             per_class[d.class_name] += 1
             seen[d.track_id].append((d.frame, d.class_name, (d.x1 + d.x2) / 2, (d.y1 + d.y2) / 2))
-        if not snap_saved and res.time_s >= snapshot_s:
-            img = res.annotated.copy()
-            cv2.rectangle(img, (0, img.shape[0] - 40), (img.shape[1], img.shape[0]), (0, 0, 0), -1)
-            cv2.putText(img, Path(model).name, (12, img.shape[0] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+        if snap is None and res.time_s >= snapshot_s:
+            snap = res.annotated.copy()
+            cv2.rectangle(snap, (0, snap.shape[0] - 40), (snap.shape[1], snap.shape[0]), (0, 0, 0), -1)
+            cv2.putText(snap, Path(model).name, (12, snap.shape[0] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
                         (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.imwrite(str(out / f"snapshot_{Path(model).stem}.jpg"), img)
-            snap_saved = True
+            if out is not None:
+                cv2.imwrite(str(out / f"snapshot_{Path(model).stem}.jpg"), snap)
+    took = time.perf_counter() - t0
     motion = tracker.motion.H if tracker.motion else None
     min_len = max(3, int(round(1.0 * meta["fps"] / stride)))
     tracks = {t: v for t, v in seen.items() if len(v) >= min_len}
@@ -62,7 +72,8 @@ def evaluate(model: str, clip: str, seconds: float, snapshot_s: float, out: Path
             moving += 1
     return {"model": tracker.model_used, "warning": tracker.warning, "frames": frames,
             "per_frame": {k: round(n / max(frames, 1), 1) for k, n in per_class.most_common()},
-            "tracks_1s": len(tracks), "moving_tracks": moving, "label_switches": switches}
+            "tracks_1s": len(tracks), "moving_tracks": moving, "label_switches": switches,
+            "device": tracker.device_used, "ms_per_frame": round(1000 * took / max(frames, 1)), "snapshot": snap}
 
 
 def main() -> None:

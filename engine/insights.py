@@ -39,6 +39,10 @@ def _speed(mps: float) -> str:
 def explain_event(e: Dict) -> str:
     """'A car (9.3 m/s, 21 mph) and a pedestrian (1.4 m/s, 3 mph) came within 1.4 m ...'"""
     a, b = NOUN.get(e["a"]["cls"], e["a"]["cls"]), NOUN.get(e["b"]["cls"], e["b"]["cls"])
+    if e.get("flag_source") == "pet":           # never close at the same instant: only their paths crossed
+        return (f"{_a(a).capitalize()} ({_speed(e['a']['speed_mps'])}) and {_a(b)} ({_speed(e['b']['speed_mps'])}) "
+                f"used the same crossing point {e['pet_s']:.1f} s apart, at {e['t_peak']:.1f} s into the video: the "
+                "second one arrived just after the first one cleared it.")
     s = (f"{_a(a).capitalize()} ({_speed(e['a']['speed_mps'])}) and {_a(b)} ({_speed(e['b']['speed_mps'])}) came "
          f"within {e['d_min_m']:.1f} m of each other at {e['t_peak']:.1f} s into the video")
     if e.get("closing_speed_mps"):
@@ -49,6 +53,9 @@ def explain_event(e: Dict) -> str:
     elif e.get("ttc_min_s") is not None:
         s += (f" If neither had slowed or turned, they would have been within touching distance in "
               f"{e['ttc_min_s']:.1f} s.")
+    if e.get("drac_max_mps2"):
+        s += (f" Avoiding it needed about {e['drac_max_mps2']:.1f} m/s² of braking"
+              + (" (harder than comfortable braking)." if e["drac_max_mps2"] >= 3.35 else "."))
     if e.get("pet_s") is not None:
         s += f" Their paths crossed, and the second one reached the crossing point {e['pet_s']:.1f} s after the first left it."
     if e.get("below_3ft"):
