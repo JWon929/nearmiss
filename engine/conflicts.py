@@ -20,7 +20,14 @@ Two indicators are computed for every pair; the event severity is the worse:
  2. Proximity - the actual minimum separation d_min reached during the encounter.
 
 Also reported (not used to flag in this version): PET, the post-encroachment
-time for paths that cross.
+time for paths that cross: the time from the first road user LEAVING the shared
+conflict area to the second ENTERING it (FHWA SSAM definition), 0 if both were
+in it at once. Each road user occupies the conflict point from when its front
+reaches it until its back clears it (HALF_LENGTH_M either side of its centre).
+
+The reported closest distance is the minimum over the whole encounter window
+(the flagged period plus ENCOUNTER_PAD_S either side). The event frame, the
+distance chart and the number all use that same window, so they agree.
 
 Filters against common false alarms:
   * Two tracks whose centres are closer than half their combined widths are one
@@ -41,8 +48,10 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .config import HALF_WIDTH_M, KIND_LABEL, SEVERITY_LEVELS, THREE_FEET_M, Settings
+from .config import HALF_LENGTH_M, HALF_WIDTH_M, KIND_LABEL, SEVERITY_LEVELS, THREE_FEET_M, Settings
 from .trajectories import Track
+
+ENCOUNTER_PAD_S = 1.5      # the distance chart and the closest-distance search both cover this much either side
 
 _ELIGIBLE = {("ped", "veh"): "ped-veh", ("bike", "veh"): "bike-veh", ("veh", "veh"): "veh-veh"}
 
@@ -119,9 +128,30 @@ def _level_from_prox(d: float, thr: List[float]) -> int:
     return 0
 
 
+def _occupancy(track: Track, k: int, P: np.ndarray, r: float) -> Tuple[float, float]:
+    """(enter, leave) times of the visit to the circle (P, r) that contains sample k, interpolated between
+    samples so the answer does not depend on the 0.1 s grid."""
+    d = np.linalg.norm(track.xy - P, axis=1) - r
+    lo, hi = k, k
+    while lo > 0 and d[lo - 1] <= 0:
+        lo -= 1
+    while hi < len(d) - 1 and d[hi + 1] <= 0:
+        hi += 1
+
+    def cross(i0, i1):          # time where d crosses 0 between samples i0 (outside) and i1 (inside)
+        f = d[i0] / (d[i0] - d[i1])
+        return float(track.t[i0] + f * (track.t[i1] - track.t[i0]))
+
+    enter = cross(lo - 1, lo) if lo > 0 else float(track.t[lo])
+    leave = cross(hi + 1, hi) if hi < len(d) - 1 else float(track.t[hi])
+    return enter, leave
+
+
 def post_encroachment_time(A: Track, B: Track, R: float, min_angle_deg: float = 30.0) -> Optional[float]:
-    """Time gap between the two users passing the point where their paths nearly meet.
-    Only for crossing paths (headings differ by >= 30 deg); None if the paths never come within R."""
+    """FHWA post-encroachment time: from the first road user's back clearing the conflict point to the second one's
+    front reaching it. The conflict point is where the two paths come closest; each road user occupies it while its
+    centre is within its half-length (HALF_LENGTH_M) of it. 0 when both occupied it at the same time. Only for
+    crossing paths (headings differ by >= 30 deg); None if the paths never come within R of each other."""
     D = np.linalg.norm(A.xy[:, None, :] - B.xy[None, :, :], axis=2)
     i, j = np.unravel_index(np.argmin(D), D.shape)
     if D[i, j] > R:
@@ -133,7 +163,13 @@ def post_encroachment_time(A: Track, B: Track, R: float, min_angle_deg: float = 
     cosang = np.clip(np.dot(va, vb) / (na * nb), -1.0, 1.0)
     if np.degrees(np.arccos(cosang)) < min_angle_deg:
         return None
-    return float(abs(A.t[i] - B.t[j]))
+    P = (A.xy[i] + B.xy[j]) / 2.0
+    reach = D[i, j] / 2.0 + 1e-6                    # each path passes this far from P at its nearest
+    a_in, a_out = _occupancy(A, int(i), P, max(HALF_LENGTH_M.get(A.cls, 1.0), reach))
+    b_in, b_out = _occupancy(B, int(j), P, max(HALF_LENGTH_M.get(B.cls, 1.0), reach))
+    if a_in <= b_out and b_in <= a_out:
+        return 0.0                                  # both were in the conflict area at once
+    return b_in - a_out if a_out < b_in else a_in - b_out
 
 
 def _analyze_pair(A: Track, B: Track, kind: str, S: Settings, dt: float, dropped: Dict[str, int]) -> List[Dict]:
@@ -191,9 +227,14 @@ def _analyze_pair(A: Track, B: Track, kind: str, S: Settings, dt: float, dropped
         lo, hi = int(run[0]), int(run[-1])
         if closing[run].max() < S.min_closing_speed_mps:
             continue  # never actually approached each other
-        seg_d = d[lo : hi + 1]
-        ip = lo + int(np.argmin(seg_d))
+        # closest moment over the whole encounter (what the chart shows), not just the flagged samples
+        pad = int(round(ENCOUNTER_PAD_S / dt))
+        w0, w1 = max(0, lo - pad), min(len(d) - 1, hi + pad)
+        ip = w0 + int(np.argmin(d[w0 : w1 + 1]))
         d_min = float(d[ip])
+        # the proximity flag itself only counts samples that passed the gates (e.g. not with a parked vehicle)
+        flagged = run[valid_prox[run]]
+        d_flag = float(d[flagged].min()) if len(flagged) else float("inf")
         vt = valid_ttc[run]
         ttc_min = float(ttc[run][vt].min()) if vt.any() else float("inf")
         lvl_t = _level_from_ttc(ttc_min, S) if np.isfinite(ttc_min) else 0
@@ -210,7 +251,7 @@ def _analyze_pair(A: Track, B: Track, kind: str, S: Settings, dt: float, dropped
                 elif not came_close:
                     lvl_t = 0
                     dropped["no_evasive_action"] += 1
-        lvl_p = _level_from_prox(d_min, prox_thr) if valid_prox[run].any() else 0
+        lvl_p = _level_from_prox(d_flag, prox_thr) if len(flagged) else 0
         level = max(lvl_t, lvl_p)
         if level == 0:
             if raw_ttc[run].any() and not vt.any():
@@ -244,7 +285,7 @@ def _analyze_pair(A: Track, B: Track, kind: str, S: Settings, dt: float, dropped
             reasons.append("Predicted collision in %.1f s (<= %.1f s, %s threshold)" % (ttc_min, thr, SEVERITY_LEVELS[lvl_t]))
         if lvl_p:
             thr = prox_thr[lvl_p - 1]
-            reasons.append("Came within %.1f m (<= %.1f m, %s threshold for %s)" % (d_min, thr, SEVERITY_LEVELS[lvl_p], KIND_LABEL[kind].lower()))
+            reasons.append("Came within %.1f m (<= %.1f m, %s threshold for %s)" % (d_flag, thr, SEVERITY_LEVELS[lvl_p], KIND_LABEL[kind].lower()))
         if braked:
             reasons.append("The %s braked at %.1f m/s^2 toward a stopped road user" % braked)
         if below_3ft:
@@ -261,6 +302,7 @@ def _analyze_pair(A: Track, B: Track, kind: str, S: Settings, dt: float, dropped
                 "t_end": round(float((k0 + hi) * dt), 2),
                 "ttc_min_s": None if not np.isfinite(ttc_min) else round(ttc_min, 2),
                 "d_min_m": round(d_min, 2),
+                "d_flag_m": None if not np.isfinite(d_flag) else round(d_flag, 2),
                 "closing_speed_mps": round(float(closing[run].max()), 2),
                 "pet_s": None,
                 "same_direction": same_dir,
@@ -280,15 +322,25 @@ def _analyze_pair(A: Track, B: Track, kind: str, S: Settings, dt: float, dropped
     return events
 
 
+def _rank(e: Dict) -> Tuple[int, int, float]:
+    """Higher is worse. A TTC of 0 (already inside the collision distance) is the worst TTC, not a missing one."""
+    ttc = e["ttc_min_s"]
+    return (e["severity_level"], ttc is not None, -ttc if ttc is not None else 0.0)
+
+
 def _dedupe(events: List[Dict], S: Settings) -> List[Dict]:
-    """ID switches can split one encounter into several pairs; keep the worst of each cluster."""
+    """An ID switch splits one road user into two tracks, so one encounter shows up as two pairs that SHARE a road
+    user, close in time and place. Keep the worst of each such cluster. Two pairs with no road user in common are
+    independent encounters, however close, and are both kept."""
     events = sorted(events, key=lambda e: e["t_peak"])
     kept: List[Dict] = []
     for e in events:
         dup = None
+        users = {e["a"]["track"], e["b"]["track"]}
         for k in kept:
             if (
                 k["kind"] == e["kind"]
+                and users & {k["a"]["track"], k["b"]["track"]}
                 and abs(k["t_peak"] - e["t_peak"]) <= S.dedupe_time_s
                 and np.hypot(k["x"] - e["x"], k["y"] - e["y"]) <= S.dedupe_dist_m
             ):
@@ -297,7 +349,7 @@ def _dedupe(events: List[Dict], S: Settings) -> List[Dict]:
         if dup is None:
             kept.append(e)
             continue
-        better = (e["severity_level"], -(e["ttc_min_s"] or 99)) > (dup["severity_level"], -(dup["ttc_min_s"] or 99))
+        better = _rank(e) > _rank(dup)
         n = dup["merged_duplicates"] + 1
         if better:
             kept[kept.index(dup)] = e

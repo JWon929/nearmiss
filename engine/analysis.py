@@ -41,20 +41,27 @@ def load_tracker_csv(path) -> Detections:
 
 def analyze(det: Detections, calib: Calibration, S: Settings,
             motion: Optional[Dict[int, np.ndarray]] = None,
-            roi: Optional[np.ndarray] = None) -> Tuple[List[Track], Dict, List[Dict]]:
+            roi: Optional[np.ndarray] = None, observation_s: Optional[float] = None) -> Tuple[List[Track], Dict, List[Dict]]:
+    """`observation_s`: how long the camera watched (the recording's duration). Rates per hour use it; without it
+    they fall back to the time span of the detections."""
     tracks, stats = build_tracks(det, calib, S, motion, roi)
     events = detect_conflicts(tracks, S, stats)
     stats["analysed_tracks"] = len(tracks)
-    stats.update(exposure(tracks, events, 1.0 / S.analysis_hz))
+    if observation_s is None and len(det):
+        observation_s = float(det.t.max() - det.t.min())
+    stats.update(exposure(tracks, events, 1.0 / S.analysis_hz, observation_s))
     return tracks, stats, events
 
 
-def exposure(tracks: Sequence[Track], events: Sequence[Dict], dt: float) -> Dict:
+def exposure(tracks: Sequence[Track], events: Sequence[Dict], dt: float, observation_s: Optional[float] = None) -> Dict:
     """How much traffic there was to have conflicts with, so busy and quiet clips can be compared.
 
     Raw event counts grow with traffic: twice the cars, about twice the events, with no change in risk.
     So events are also given per 100 vehicles and per 1,000 road-user pairs that were on the road at the
-    same time (only the pair kinds the engine checks: ped-veh, bike-veh, veh-veh)."""
+    same time (only the pair kinds the engine checks: ped-veh, bike-veh, veh-veh).
+
+    Events per hour divide by the OBSERVATION period (how long the camera watched), not by the time between the
+    first and last kept track, which leaves out quiet stretches and so inflates the rate."""
     from .conflicts import pair_kind
 
     ids = {}
@@ -73,7 +80,9 @@ def exposure(tracks: Sequence[Track], events: Sequence[Dict], dt: float) -> Dict
                 seen.add(key)
                 pairs[kind] += 1
     n_pairs, n_veh = sum(pairs.values()), counts.get("veh", 0)
-    hours = (max((t.k1 for t in tracks), default=0) - min((t.k0 for t in tracks), default=0)) * dt / 3600.0
+    if observation_s is None:
+        observation_s = (max((t.k1 for t in tracks), default=0) - min((t.k0 for t in tracks), default=0)) * dt
+    hours = observation_s / 3600.0
     by_kind = {k: sum(1 for e in events if e["kind"] == k) for k in pairs}
     return {
         "road_users": counts,
@@ -83,6 +92,7 @@ def exposure(tracks: Sequence[Track], events: Sequence[Dict], dt: float) -> Dict
         "events_per_1000_pairs_by_kind": {k: round(1000.0 * by_kind[k] / pairs[k], 2) if pairs[k] else None
                                           for k in pairs},
         "events_per_hour": round(len(events) / hours, 1) if hours > 0 else None,
+        "observation_s": round(float(observation_s), 1),
     }
 
 
@@ -99,23 +109,43 @@ def boxes_near(det: Detections, t: float, max_dt: float = 0.5) -> List[Tuple[int
 
 
 def event_frame(video_path: str, det: Detections, ev: Dict, privacy_level: str = "standard",
-                blur: bool = True) -> np.ndarray:
-    """Full-resolution frame at the moment of closest approach: road users blurred, the two involved ones outlined."""
+                blur: bool = True, t: Optional[float] = None, emphasis: bool = False, zoom: bool = False) -> np.ndarray:
+    """Full-resolution frame at the moment of closest approach (or at time `t`): road users blurred, the two involved
+    ones outlined. `emphasis` dims everything except the two road users; `zoom` crops to them."""
     from video_utils import grab_frame
 
-    img = grab_frame(video_path, ev["t_peak"])
-    near = boxes_near(det, ev["t_peak"])
+    t = ev["t_peak"] if t is None else t
+    img = grab_frame(video_path, t)
+    near = boxes_near(det, t)
     if blur:
         img = blur_detections(img, [(c, b) for _, c, b in near], privacy_level)
     col = SEV_COLOR.get(ev["severity"], (0, 200, 255))
-    centers = []
+    centers, mine = [], []
     for tid, c, b in near:
         if tid in (ev["a"]["track"], ev["b"]["track"]):
+            mine.append(b)
             x1, y1, x2, y2 = [int(v) for v in b]
             cv2.rectangle(img, (x1, y1), (x2, y2), col, 3)
-            centers.append(((x1 + x2) // 2, y2))
+            centers.append(((x1 + x2) // 2, (y1 + y2) // 2))
     if len(centers) == 2:
         cv2.line(img, centers[0], centers[1], col, 2, cv2.LINE_AA)
+    if mine and (emphasis or zoom):
+        h, w = img.shape[:2]
+        b = np.array(mine)
+        side = max(b[:, 2].max() - b[:, 0].min(), b[:, 3].max() - b[:, 1].min())
+        pad = max(0.6 * side, 0.08 * max(w, h))
+        x1, y1 = int(max(0, b[:, 0].min() - pad)), int(max(0, b[:, 1].min() - pad))
+        x2, y2 = int(min(w, b[:, 2].max() + pad)), int(min(h, b[:, 3].max() + pad))
+        if emphasis:
+            dim = (img * 0.45).astype(img.dtype)
+            dim[y1:y2, x1:x2] = img[y1:y2, x1:x2]
+            img = dim
+        if zoom:
+            img = img[y1:y2, x1:x2].copy()
+            s = 900.0 / max(img.shape[:2])
+            if s > 1:
+                img = cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC)
+            return img
     label = f"{ev['id']}  {ev['kind_label']}  closest {ev['d_min_m']} m"
     if ev.get("ttc_min_s") is not None:
         label += f"  TTC {ev['ttc_min_s']} s"
@@ -124,8 +154,9 @@ def event_frame(video_path: str, det: Detections, ev: Dict, privacy_level: str =
     return img
 
 
-def cut_clip(src_video: str, out_path: str, t0: float, t1: float) -> bool:
-    """Cut [t0, t1] out of a video as browser-playable H.264. Returns False if ffmpeg is missing or fails."""
+def cut_clip(src_video: str, out_path: str, t0: float, t1: float, max_width: Optional[int] = None) -> bool:
+    """Cut [t0, t1] out of a video as browser-playable H.264 (no wider than `max_width`). Returns False if ffmpeg
+    is missing or fails."""
     from video_utils import ffmpeg_exe
 
     exe = ffmpeg_exe()
@@ -133,8 +164,10 @@ def cut_clip(src_video: str, out_path: str, t0: float, t1: float) -> bool:
         return False
     t0 = max(0.0, t0)
     cmd = [exe, "-y", "-loglevel", "error", "-ss", f"{t0:.3f}", "-i", src_video, "-t", f"{max(0.5, t1 - t0):.3f}",
-           "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "24", "-pix_fmt", "yuv420p",
-           "-movflags", "+faststart", out_path]
+           "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "24" if not max_width else "28",
+           "-pix_fmt", "yuv420p", "-movflags", "+faststart", out_path]
+    if max_width:
+        cmd[-1:-1] = ["-vf", f"scale='min({int(max_width)},iw)':-2"]
     try:
         return subprocess.run(cmd, timeout=120).returncode == 0 and Path(out_path).exists()
     except Exception:
@@ -144,9 +177,11 @@ def cut_clip(src_video: str, out_path: str, t0: float, t1: float) -> bool:
 # ------------------------------------------------------------------ top-down map
 def topdown_map(tracks: Sequence[Track], events: Sequence[Dict], calib: Calibration,
                 size: int = 900, heat: bool = True, show_tracks: bool = True,
-                zones: Sequence[Tuple[str, np.ndarray, Tuple[int, int, int]]] = ()) -> np.ndarray:
+                zones: Sequence[Tuple[str, np.ndarray, Tuple[int, int, int]]] = (), highlight: Optional[str] = None,
+                markers_out: Optional[Dict[str, Tuple[int, int]]] = None) -> np.ndarray:
     """Bird's-eye picture: trajectories, a heat layer of events, event markers, a metre scale bar.
-    `zones` are (name, polygon in map metres, BGR colour) outlines drawn under everything else."""
+    `zones` are (name, polygon in map metres, BGR colour) outlines drawn under everything else. `highlight` rings one
+    event (by id); `markers_out` receives each event's marker position in pixels, so a click can be matched to it."""
     pts = [t.xy for t in tracks if len(t.xy)]
     pts += [np.array([[e["x"], e["y"]] for e in events])] if events else []
     corners, _ = calib.img_to_map(calib.image_points)
@@ -160,7 +195,9 @@ def topdown_map(tracks: Sequence[Track], events: Sequence[Dict], calib: Calibrat
 
     def px(p):
         p = np.atleast_2d(p)
-        return np.c_[20 + (p[:, 0] - lo[0]) * s, h - 20 - (p[:, 1] - lo[1]) * s]
+        # map metres have y pointing DOWN like the screen (calibration.rot keeps 'up on screen' = -y), so y is not
+        # flipped here: flipping it made the map a mirror image of the camera view
+        return np.c_[20 + (p[:, 0] - lo[0]) * s, 20 + (p[:, 1] - lo[1]) * s]
 
     img = np.full((h, w, 3), 245, np.uint8)
     for name, poly, col in zones:
@@ -191,6 +228,10 @@ def topdown_map(tracks: Sequence[Track], events: Sequence[Dict], calib: Calibrat
             img = (img * (1 - a) + hm * a).astype(np.uint8)
     for e in events:
         x, y = px([e["x"], e["y"]])[0]
+        if markers_out is not None:
+            markers_out[e["id"]] = (int(x), int(y))
+        if e["id"] == highlight:
+            cv2.circle(img, (int(x), int(y)), 15, (20, 20, 20), 3, cv2.LINE_AA)
         cv2.circle(img, (int(x), int(y)), 7, SEV_COLOR.get(e["severity"], (0, 200, 255)), -1, cv2.LINE_AA)
         cv2.circle(img, (int(x), int(y)), 7, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(img, e["id"], (int(x) + 9, int(y) - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (30, 30, 30), 1,
@@ -237,9 +278,12 @@ def build_report_html(title: str, meta: Dict, calib_info: Dict, S: Settings, eve
                       validation: Dict, ai_disclosure: str, map_png_b64: str,
                       frames_b64: Optional[Dict[str, str]] = None, notes: Sequence[str] = (),
                       exposure: Optional[Dict] = None, info: Optional[Dict] = None, explain=None,
-                      speeds: Optional[Dict] = None, zone_rows: Optional[Sequence[Dict]] = None) -> str:
+                      speeds: Optional[Dict] = None, zone_rows: Optional[Sequence[Dict]] = None,
+                      sections: Sequence[Tuple[str, str]] = (), planner: bool = False) -> str:
     """One self-contained HTML page (print it to PDF from the browser). `notes` are blind spots to state up front,
-    `info` the recording details sheet, `explain` turns an event into a plain-language sentence."""
+    `info` the recording details sheet, `explain` turns an event into a plain-language sentence. `sections` are
+    extra (title, html) blocks shown right after the notes (summary, movements, phases). `planner` puts the plain
+    summary first and moves the raw settings into an appendix; an empty `ai_disclosure` leaves that section out."""
     esc = html.escape
     frames_b64 = frames_b64 or {}
     info_rows = "".join(f"<tr><th>{esc(k.replace('_', ' '))}</th><td>{esc(str(v))}</td></tr>"
@@ -285,6 +329,10 @@ def build_report_html(title: str, meta: Dict, calib_info: Dict, S: Settings, eve
                   + f"<small>{esc('; '.join(e.get('reasons', [])))}</small>"
                   + (f"<br><img src='data:image/jpeg;base64,{img}'>" if img else "") + "</div>")
     v = json.dumps(validation, indent=1)
+    extra_html = "".join(f"<h2>{esc(t)}</h2>{body}" for t, body in sections)
+    technical = (f"<h2>Recording</h2><pre>{esc(json.dumps(meta, indent=1))}</pre>"
+                 f"<h2>Calibration</h2><pre>{esc(json.dumps(calib_info, indent=1))}</pre>"
+                 f"<h2>Thresholds used</h2><pre>{esc(json.dumps(S.to_dict(), indent=1))}</pre>")
     return f"""<!doctype html><html><head><meta charset='utf-8'><title>{esc(title)}</title>
 <style>body{{font:15px/1.5 system-ui,sans-serif;max-width:900px;margin:24px auto;padding:0 16px;color:#222}}
 table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ccc;padding:4px 8px;text-align:left}}
@@ -294,13 +342,12 @@ img{{max-width:100%;border-radius:6px}}pre{{background:#f4f4f4;padding:10px;over
 <h1>{esc(title)}</h1>
 <p><b>Screening report, not a safety certification.</b> Flags show where road users came close or crossed paths in
 this one recording. They do not predict crashes. Footage is a single fixed camera; distances are only as good as the
-calibration below.</p>{notes_html}
-{info_html}<h2>Recording</h2><pre>{esc(json.dumps(meta, indent=1))}</pre>{exposure_html}{speed_html}
-<h2>Calibration</h2><pre>{esc(json.dumps(calib_info, indent=1))}</pre>
-<h2>Thresholds used</h2><pre>{esc(json.dumps(S.to_dict(), indent=1))}</pre>
+calibration below.</p>{notes_html}{extra_html}
+{info_html}{"" if planner else technical}{exposure_html}{speed_html}
 <h2>Top-down map</h2><img src='data:image/png;base64,{map_png_b64}'>{zones_html}
 <h2>Events ({len(events)})</h2><table><tr><th>ID</th><th>t (s)</th><th>Type</th><th>Severity</th><th>Closest (m)</th>
 <th>Min TTC (s)</th><th>PET (s)</th><th>Zone</th><th>My label</th></tr>{rows}</table>{cards}
-<h2>Validation (my own review of the flags)</h2>{unreviewed}{kind_table}<pre>{esc(v)}</pre>
-<h2>AI use disclosure</h2><p>{esc(ai_disclosure).replace(chr(10), '<br>')}</p>
+<h2>Validation (my own review of the flags)</h2>{unreviewed}{kind_table}{"" if planner else f"<pre>{esc(v)}</pre>"}
+{f"<h2>Appendix: settings used</h2>{technical}" if planner else ""}
+{f"<h2>AI use disclosure</h2><p>{esc(ai_disclosure).replace(chr(10), '<br>')}</p>" if ai_disclosure.strip() else ""}
 </body></html>"""

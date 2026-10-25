@@ -44,7 +44,13 @@ def test_car_pedestrian_near_miss_is_flagged_serious(run):
     assert e["severity"] == "serious" and e["kind"] == "ped-veh"
     assert e["t_peak"] == pytest.approx(12.0, abs=0.5)
     assert e["d_min_m"] == pytest.approx(1.4, abs=0.4)       # script: ped crossed 1.0 s earlier, 1.4 m offset
-    assert e["pet_s"] == pytest.approx(1.0, abs=0.3)
+    # script: the pedestrian's centre crossed the car's path 1.0 s before the car's centre. PET (FHWA) runs from the
+    # pedestrian's back clearing the conflict point to the car's front reaching it, so it is shorter by the time
+    # each body takes to cover its half-length.
+    ped = e["b"] if e["b"]["cls"] == "pedestrian" else e["a"]
+    car = e["a"] if ped is e["b"] else e["b"]
+    expected = 1.0 - 0.3 / ped["speed_mps"] - 2.3 / car["speed_mps"]
+    assert e["pet_s"] == pytest.approx(expected, abs=0.25) and e["pet_s"] < 1.0
 
 
 def test_close_pass_is_flagged_and_marked_under_three_feet(run):

@@ -223,7 +223,9 @@ def build_tracks(det: Detections, calib: Calibration, S: Settings,
     half = max(1, int(round(S.smooth_window_s / dt / 2.0)))
     riders = find_rider_tracks(det)
     stats = {"raw_tracks": len(det.track_ids()), "dropped_riders": len(riders), "dropped_short": 0,
-             "dropped_out_of_range": 0, "dropped_outside_roi": 0, "dropped_static_clutter": 0, "track_breaks": 0}
+             "dropped_out_of_range": 0, "dropped_outside_roi": 0, "dropped_static_clutter": 0, "track_breaks": 0,
+             "static_clutter_ids": []}
+    keep = {int(k) for k in S.keep_tracks}
     tracks: List[Track] = []
     center = calib.center_map
     for tid in det.track_ids():
@@ -246,9 +248,10 @@ def build_tracks(det: Detections, calib: Calibration, S: Settings,
         if valid.sum() < S.min_hits:
             stats["dropped_out_of_range" if len(idx) >= S.min_hits else "dropped_short"] += 1
             continue
-        if S.static_clutter_boxes > 0 and cls in STILL_CLASSES and is_still(boxes, det.frame[idx], motion,
-                                                                            S.static_clutter_boxes):
-            stats["dropped_static_clutter"] += 1      # never moved: a pole or a box, not a person
+        if (S.static_clutter_boxes > 0 and S.ground_point == "center" and cls in STILL_CLASSES and tid not in keep
+                and is_still(boxes, det.frame[idx], motion, S.static_clutter_boxes)):
+            stats["dropped_static_clutter"] += 1      # never moved: probably a pole or a box, not a person
+            stats["static_clutter_ids"].append(int(tid))
             continue
         t, mp = det.t[idx][valid], mp[valid]
         cuts = [0] + list(np.flatnonzero(np.diff(t) > S.max_gap_s) + 1) + [len(t)]

@@ -55,6 +55,33 @@ are not flagged. The Results page shows how many flags each filter removed.
 **Road area (optional).** On **Calibrate**, choose *Road area outline* and click around the roadway and crosswalks.
 Road users outside it (parked cars in a lot, people on the sidewalk) are ignored.
 
+## How far to trust the numbers
+- **Calibration status** (good / not checked / problem) is shown on every page. Until a second known distance is
+  checked, or when it is more than 10% off, or cars measure an implausible length, every severity is marked
+  *provisional*. Results and Report list every limitation in one quality panel, each with the page that fixes it.
+- **Labels** belong to exactly one event: matched by the two road users involved, then by time. One label can no
+  longer count for two events a moment apart. Imported label files are checked and bad entries are listed.
+- **De-duplication** merges two flagged pairs only when they share a road user (an ID switch). A TTC of 0 counts as
+  the worst TTC, not a missing one.
+- **Closest distance** is the minimum over the whole encounter; the number, the picture and the distance chart agree.
+- **PET** follows FHWA: from the first road user's back clearing the conflict point to the second one's front
+  reaching it.
+- **Rates** divide by the whole observation period; *flagged* and *confirmed* (labelled real) are kept apart.
+- **Street furniture** (drone footage only): pedestrians and bikes that never move are left out, and shown on
+  Results > Quality so a real waiting person can be restored. Street-level footage is never filtered this way.
+- **Reports** are marked out of date when labels, calibration, settings or details change after they were built.
+
+## Movements, signal phases and before/after
+Results > Traffic & movements names each road user's approach (northbound...) and turn (through, left, right),
+counts road users and events per movement, and tags events with signal phases you type (`0-28 NS green`).
+Report > Compare recordings adds up a *before* and an *after* set of recordings and compares rates, warning when
+thresholds, models or calibration quality differ.
+
+## Proposed designs (not built yet)
+The *Proposed designs* page runs the same conflict check on simulated trajectories of each design alternative (the
+FHWA SSAM approach): export `t_s, id, class, x_m, y_m` per road user from SUMO, VISSIM or Aimsun, one CSV per
+alternative. Two sample alternatives are included. Compare alternatives with each other, never with video counts.
+
 ## Comparing clips fairly
 Raw event counts grow with traffic. Results also shows events per 100 vehicles, per 1,000 road-user pairs that were
 on the road at the same time (overall and per conflict type), and per hour.

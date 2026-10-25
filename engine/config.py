@@ -32,6 +32,17 @@ HALF_WIDTH_M: Dict[str, float] = {
     "truck": 1.3,
 }
 
+# Rough half-lengths (m), along the direction of travel. Used for post-encroachment time: a road user occupies a
+# point from when its front reaches it until its back clears it.
+HALF_LENGTH_M: Dict[str, float] = {
+    "pedestrian": 0.3,
+    "bicycle": 0.9,
+    "motorcycle": 1.1,
+    "car": 2.3,
+    "bus": 6.0,
+    "truck": 4.0,
+}
+
 KIND_LABEL: Dict[str, str] = {
     "ped-veh": "Vehicle-Pedestrian",
     "bike-veh": "Vehicle-Bicycle",
@@ -63,8 +74,11 @@ class Settings:
     # furniture the model mistook for a road user (lamp posts, signal boxes, bins). Measured in pixels after camera-
     # motion compensation, so it works even when the calibration is off. On our drone clip those objects moved at
     # most 1.4 box sizes (tall ones seem to sway as the drone moves); real pedestrians and cyclists moved 7-11.
-    # 0 turns the check off.
+    # 0 turns the check off. Only applied to overhead footage (ground_point "center"): street-level models rarely
+    # mistake furniture for people, and there a waiting pedestrian is common and must not be dropped.
     static_clutter_boxes: float = 3.0
+    # Track IDs the user confirmed as real road users (e.g. a pedestrian who waited the whole clip): never dropped.
+    keep_tracks: List[int] = field(default_factory=list)
 
     # --- conflict engine -------------------------------------------------------
     # Indicator 1: time-to-collision (TTC), constant-velocity model, to a "collision radius".
