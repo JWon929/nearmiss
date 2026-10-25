@@ -1,9 +1,11 @@
-ultralytics
-lapx
-opencv-python-headless
-streamlit
-streamlit-image-coordinates
-imageio-ffmpeg
-pandas
-numpy
-pytest
+# Pinned to the versions NearMiss was tested with. Training the drone model runs on Google Colab instead
+# (tools/train_visdrone_colab.ipynb installs its own packages).
+ultralytics==8.4.183
+lapx==0.11.1
+opencv-python-headless==5.0.0.93
+streamlit==1.66.1
+streamlit-image-coordinates==0.4.1
+imageio-ffmpeg==0.6.0
+pandas==3.0.6
+numpy==2.5.4
+pytest==9.1.1

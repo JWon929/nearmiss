@@ -105,3 +105,24 @@ def summarize(events: List[Dict], store: Dict) -> Dict:
         "orphaned_labels": sum(1 for lab in labels if id(lab) not in matched),
         "caveat": "Precision is over reviewed events only. Recall is an upper bound: it counts only misses you noticed.",
     }
+
+
+def combine(summaries: List[Dict]) -> Dict:
+    """Totals over several recordings: precision is recomputed from the summed counts, never averaged."""
+    tot = {"events_flagged": 0, "tp": 0, "fp": 0, "unsure": 0, "unreviewed": 0, "missed": 0}
+    by_kind: Dict[str, Dict] = {}
+    for s in summaries:
+        for k in tot:
+            tot[k] += s[k]
+        for kind, row in s.get("by_kind", {}).items():
+            acc = by_kind.setdefault(kind, {"flagged": 0, "tp": 0, "fp": 0, "unsure": 0, "unreviewed": 0})
+            for k in acc:
+                acc[k] += row[k]
+    for row in by_kind.values():
+        row["precision"] = round(row["tp"] / (row["tp"] + row["fp"]), 3) if row["tp"] + row["fp"] else None
+    tot["precision"] = round(tot["tp"] / (tot["tp"] + tot["fp"]), 3) if tot["tp"] + tot["fp"] else None
+    tot["recall_upper_bound"] = round(tot["tp"] / (tot["tp"] + tot["missed"]), 3) if tot["tp"] + tot["missed"] else None
+    tot["by_kind"] = by_kind
+    tot["recordings"] = len(summaries)
+    return tot
+

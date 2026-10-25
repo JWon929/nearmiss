@@ -37,6 +37,7 @@ class CameraMotion:
         self.H: Dict[int, np.ndarray] = {}
         self.inliers: Dict[int, int] = {}
         self.lost: List[int] = []   # frames where no transform could be found (previous one reused)
+        self.chained: List[int] = []  # frames matched to the previous frame only (small errors add up)
 
     def _features(self, frame: np.ndarray, boxes: Sequence[Sequence[float]]):
         h, w = frame.shape[:2]
@@ -82,6 +83,7 @@ class CameraMotion:
             step = self._match(feats, self._prev[:2])
             if step is not None:
                 H_small, n = self._prev[2] @ step[0], step[1]
+                self.chained.append(frame_idx)
         if H_small is None:
             H_small = self._prev[2]
             self.lost.append(frame_idx)
@@ -101,7 +103,8 @@ class CameraMotion:
             p = probe @ H.T
             shifts.append(float(np.max(np.hypot(*(p[:, :2] / p[:, 2:3] - probe[:, :2]).T))))
         return {"frames": len(self.H), "max_shift_px": round(max(shifts, default=0.0), 1),
-                "lost_frames": len(self.lost),
+                "lost_frames": len(self.lost), "chained_frames": len(self.chained),
+                "direct_frames": len(self.H) - len(self.lost) - len(self.chained),
                 "median_inliers": int(np.median(list(self.inliers.values()))) if self.inliers else 0}
 
     def to_dict(self, frame_size) -> Dict:

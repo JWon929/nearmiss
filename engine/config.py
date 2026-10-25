@@ -59,6 +59,12 @@ class Settings:
     # Which pixel of a box touches the road: "bottom" (bottom-centre) for a camera that looks at the road at an
     # angle, "center" for a camera looking straight down (drone), where the bottom edge is half a car away.
     ground_point: str = "bottom"
+    # Pedestrian, bicycle and motorcycle tracks that never move more than this many of their own box sizes are street
+    # furniture the model mistook for a road user (lamp posts, signal boxes, bins). Measured in pixels after camera-
+    # motion compensation, so it works even when the calibration is off. On our drone clip those objects moved at
+    # most 1.4 box sizes (tall ones seem to sway as the drone moves); real pedestrians and cyclists moved 7-11.
+    # 0 turns the check off.
+    static_clutter_boxes: float = 3.0
 
     # --- conflict engine -------------------------------------------------------
     # Indicator 1: time-to-collision (TTC), constant-velocity model, to a "collision radius".

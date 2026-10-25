@@ -1,8 +1,12 @@
 """
 Detection + multi-object tracking for NearMiss.
 
-Detection uses a PRETRAINED Ultralytics YOLO model (COCO classes: person, bicycle, car, motorcycle,
-bus, truck). Tracking uses Ultralytics' built-in ByteTrack. Both are disclosed in the app.
+Detection uses Ultralytics YOLO models, disclosed in the app:
+  * street-level cameras: pretrained YOLOv8 (COCO classes: person, bicycle, car, motorcycle, bus, truck);
+  * drone footage: pretrained YOLO11-OBB (DOTA aerial photos, vehicles only, rotated boxes), or
+    nearmiss-visdrone.pt, a YOLO11s fine-tuned on the VisDrone dataset in tools/train_visdrone_colab.ipynb,
+    which also finds pedestrians and bikes from above.
+Tracking uses Ultralytics' built-in ByteTrack.
 
 Why the old version highlighted objects only "for a brief moment"
 -----------------------------------------------------------------
@@ -80,12 +84,24 @@ HERE = Path(__file__).resolve().parent
 
 
 def aerial_choices() -> Dict[str, str]:
-    """Overhead models to offer; the VisDrone-trained one first when its weights are in the app folder."""
+    """Overhead models to offer. The stock aerial model stays the default: on our test clip it kept car/truck
+    labels steady (1 flip vs 11) and called only the 3 real trucks trucks (vs 7). The VisDrone-trained model
+    comes second when its weights are in the app folder: it tracked more road users and is the only overhead
+    model that finds pedestrians and bikes."""
+    choices = dict(AERIAL_CHOICES)
     if (HERE / VISDRONE_MODEL).exists():
-        return {VISDRONE_MODEL: "overhead / drone, trained on VisDrone: vehicles, pedestrians and bikes",
-                **AERIAL_CHOICES}
-    return dict(AERIAL_CHOICES)
+        first = next(iter(choices))
+        choices = {first: choices.pop(first),
+                   VISDRONE_MODEL: "overhead / drone, trained on VisDrone: ALSO finds pedestrians and bikes "
+                                   "(car/truck labels less steady)", **choices}
+    return choices
 
+
+# Small road users from above are easy to confuse with street furniture: the VisDrone model called lamp posts,
+# signal heads and utility boxes "pedestrian" or "motorcycle" on our test clip. None of those ever moves, so from
+# above a person / bike box is only drawn once its road user has moved this many times its own box size.
+SMALL_CLASSES = ("person", "bicycle", "motorcycle")
+CONFIRM_MOVE_BOXES = 3.0      # same rule as Settings.static_clutter_boxes in the analysis
 
 TRUCK_LENGTH_RATIO = 1.6   # from above: a truck or bus is at least 1.6 x a typical car's length (car ~4.6 m -> 7.4 m)
 CAR_ASPECT = 2.5           # a car is about 2.5 x as long as it is wide (4.6 m x 1.8 m)
@@ -450,6 +466,9 @@ class RoadUserTracker:
 
             self.motion = CameraMotion() if self.s.stabilize else None
             ref_length = None
+            hide_still = is_aerial(self.model_used) and finds_people(self.model_used)
+            first_seen: Dict[int, Tuple[float, float]] = {}     # small road user -> first centre (reference pixels)
+            confirmed = set()
             for n, result in enumerate(results()):
                 frame_idx = n * stride
                 time_s = round(frame_idx / fps, 3) if fps > 0 else 0.0
@@ -470,6 +489,18 @@ class RoadUserTracker:
                                               round(float(conf), 3), float(x1), float(y1), float(x2), float(y2)))
                 H = self.motion.update(frame_idx, frame, [(d.x1, d.y1, d.x2, d.y2) for d in dets]) if self.motion else None
                 items = memory.update(n, dets, (frame.shape[1], frame.shape[0]))
+                if hide_still:
+                    for d in dets:
+                        if d.class_name not in SMALL_CLASSES or d.track_id in confirmed:
+                            continue
+                        c = np.array([d.center])
+                        if H is not None:
+                            c = cv2.perspectiveTransform(c[None], H)[0]
+                        start = first_seen.setdefault(d.track_id, tuple(c[0]))
+                        size = max(d.x2 - d.x1, d.y2 - d.y1)
+                        if np.hypot(c[0][0] - start[0], c[0][1] - start[1]) > CONFIRM_MOVE_BOXES * size:
+                            confirmed.add(d.track_id)
+                    items = [i for i in items if i.class_name not in SMALL_CLASSES or i.track_id in confirmed]
                 self.stats["frames"] += 1
                 if any(not i.live for i in items):
                     self.stats["frames_with_carried_boxes"] += 1

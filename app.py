@@ -2,8 +2,8 @@
 NearMiss: screening tool for potential traffic conflicts at an intersection (not a crash predictor).
 
 Pages: Detect -> Calibrate -> Results -> Event Review -> Report -> Method.
-Detection uses a pretrained YOLO model (COCO classes for street-level cameras, DOTA aerial classes for
-drones) and ByteTrack; everything after that (camera-motion compensation, calibration, TTC / closest
+Detection uses YOLO models (YOLOv8 / COCO for street-level cameras; YOLO11-OBB / DOTA, or a YOLO11s fine-tuned on
+VisDrone, for drones) and ByteTrack; everything after that (camera-motion compensation, calibration, TTC / closest
 approach / PET, privacy blur, validation) is in engine/.
 
 Run:  streamlit run app.py
@@ -25,8 +25,8 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-from detector_tracker import (MODEL_CHOICES, RenderOptions, RoadUserTracker, TrackerSettings, aerial_choices,
-                              auto_stride, finds_people, pick_device)
+from detector_tracker import (MODEL_CHOICES, VISDRONE_MODEL, RenderOptions, RoadUserTracker, TrackerSettings,
+                              aerial_choices, auto_stride, finds_people, pick_device)
 from engine import demo
 from engine import validation
 from engine.analysis import (analyze, build_report_html, cut_clip, distance_series, event_frame, events_table,
@@ -299,6 +299,32 @@ def blind_spot(m: dict):
             "not a safe result.")
 
 
+def limit_notes(a) -> list:
+    """Plain warnings about what limits this recording's numbers (besides the vehicles-only blind spot), shown on
+    Results and Report and printed in the report: an unchecked or poor calibration, frames that could not be lined
+    up, and cars that measure the wrong size."""
+    if meta.get("synthetic"):
+        return []
+    notes = []
+    _, d = load_calibration(rid)
+    checks = (d or {}).get("checks") or []
+    if d is not None and not checks:
+        notes.append("The calibration has not been checked against a second known distance, so how far off distances "
+                     "and speeds are is unknown. Do the accuracy check on the Calibrate page.")
+    elif checks and abs(checks[0]["error_pct"]) > 10:
+        notes.append(f"The calibration check measured a known {checks[0]['known_m']} m as {checks[0]['measured_m']} m "
+                     f"({checks[0]['error_pct']:+.1f}%). Distances and speeds are off by about that much.")
+    ms = (read_json(run_dir(rid) / "motion.json") or {}).get("summary")
+    if ms and ms.get("frames") and ms.get("lost_frames", 0) > 0.05 * ms["frames"]:
+        notes.append(f"{ms['lost_frames']} of {ms['frames']} frames could not be lined up with the first frame "
+                     "(camera moved too much, or too little texture). Positions on those frames are less reliable.")
+    if a is not None:
+        size = vehicle_size_check(a[2], a[0], a[1], load_motion(read_json(run_dir(rid) / "motion.json")))
+        if size and size["warning"]:
+            notes.append(size["warning"])
+    return notes
+
+
 def settings_banner() -> str:
     """One line tying every page's numbers to the settings that produced them."""
     S = load_settings(rid)
@@ -339,6 +365,47 @@ def need_run() -> bool:
 
 
 # ================================================================== DETECT
+def model_error(name: str, e: Exception) -> str:
+    return (f"Could not load the model {name} ({type(e).__name__}: {e}). What to try: standard models are downloaded "
+            "the first time they are used, so check the internet connection. A custom model (such as "
+            f"{VISDRONE_MODEL}) must be in the app folder next to app.py.")
+
+
+def quick_test(path: str, m: dict, ts: TrackerSettings, ro: RenderOptions, seconds: float = 10.0) -> None:
+    """Run the chosen settings on the first few seconds only, so a bad model or threshold shows up in a minute,
+    not after a full run. Nothing is saved."""
+    prog = st.progress(0.0, text="Loading model...")
+    try:
+        tracker = RoadUserTracker(ts, ro)
+    except Exception as e:
+        prog.empty()
+        st.error(model_error(ts.model_name, e))
+        return
+    counts, frames, snap, tracks = {}, 0, None, set()
+    for res in tracker.process_video(path, m["fps"]):
+        if res.time_s > seconds:
+            break
+        frames += 1
+        for d in res.detections:
+            counts[d.class_name] = counts.get(d.class_name, 0) + 1
+            tracks.add(d.track_id)
+        if snap is None or res.time_s <= seconds / 2:
+            snap = res.annotated
+        prog.progress(min(res.time_s / seconds, 1.0), text=f"Testing: {res.time_s:.1f} of {seconds:.0f} s")
+    prog.empty()
+    if not frames:
+        st.error("No frames could be read from the video. Re-export it as H.264 MP4 and upload it again.")
+        return
+    per = ", ".join(f"{n / frames:.1f} {c}" for c, n in sorted(counts.items(), key=lambda kv: -kv[1])) or "nothing"
+    (st.success if counts else st.error)(f"First {seconds:.0f} s with {tracker.model_used}: {len(tracks)} tracks; "
+                                         f"per frame {per}.")
+    if tracker.warning:
+        st.warning(tracker.warning)
+    if snap is not None:
+        st.image(rgb(snap), width="stretch", caption=f"Frame at about {seconds / 2:.0f} s. Are the road users boxed, "
+                 "with the right labels? If not, try another model or a lower confidence before the full run.")
+
+
 def page_detect():
     page_header("Detect", "Detect and track road users",
                 "Upload an intersection clip. Works best from a camera that stays still (tripod, pole, hovering "
@@ -350,12 +417,19 @@ def page_detect():
     overhead = view == "overhead"
     choices = aerial_choices() if overhead else MODEL_CHOICES
     c1, c2, c3 = st.columns(3)
-    model = c1.selectbox("Model", list(choices), format_func=lambda m: f"{m}  ({choices[m]})")
+    model = c1.selectbox("Model", list(choices), key=f"model_{view}", format_func=lambda m: f"{m}  ({choices[m]})")
     if overhead and not finds_people(model):
-        st.caption("This model was trained on aerial photos. It finds cars, buses and trucks seen from above, but "
-                   "**not pedestrians or bicycles**, so only vehicle-vehicle conflicts can be flagged. To find them "
-                   "too, train the VisDrone model (tools/train_visdrone_colab.ipynb) and put `nearmiss-visdrone.pt` "
-                   "in the app folder.")
+        msg = ("This model finds cars, buses and trucks seen from above, but **not pedestrians or bicycles**, so only "
+               "vehicle-vehicle conflicts can be flagged.")
+        msg += (f" Choose **{VISDRONE_MODEL}** to include them." if VISDRONE_MODEL in choices else
+                f" To find them too, train the VisDrone model (tools/train_visdrone_colab.ipynb) and put "
+                f"`{VISDRONE_MODEL}` in the app folder.")
+        st.warning(msg)
+    elif model == VISDRONE_MODEL:
+        st.info("Also finds pedestrians, bikes and motorcycles from above. It mistakes some street furniture (lamp "
+                "posts, signal boxes) for people, so a pedestrian or bike that **never moves** is hidden in the video "
+                "and left out of the analysis. Its car/truck labels are less steady than the default model's. Use "
+                "*Try on the first 10 s* to check.")
     imgsz = c2.select_slider("Detection size (px)", [640, 800, 960, 1280], value=960,
                              help="Bigger finds smaller or farther road users but is slower. "
                                   "For overhead models 960 works best: bigger sizes start calling cars 'large vehicles'.")
@@ -402,7 +476,16 @@ def page_detect():
     cols[3].metric("Frames", m["frame_count"])
     stride = auto_stride(m["fps"]) if stride_auto else 1
     st.caption(f"Will analyse every {stride} frame(s). Device: {pick_device(device)}.")
-    if not st.button("Run detection + tracking", type="primary"):
+    ts = TrackerSettings(model_name=model, imgsz=imgsz, high_conf=high, start_conf=start, track_buffer_s=buffer_s,
+                         stride=stride, device=device, coast_s=coast, trail_s=trail, stabilize=stabilize)
+    ro = RenderOptions(blur_privacy=blur, privacy_level=level, show_trails=trail > 0, show_confidence=conf_show)
+    a, b = st.columns([1, 3])
+    test = a.button("Try on the first 10 s", icon=":material/science:",
+                    help="Quick check of the model and settings before the full run. Nothing is saved.")
+    run = b.button("Run detection + tracking", type="primary")
+    if test:
+        quick_test(str(src_tmp), m, ts, ro)
+    if not run:
         return
 
     new_id = time.strftime("%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4]
@@ -410,15 +493,12 @@ def page_detect():
     d.mkdir(parents=True)
     src = d / "source.mp4"
     shutil.move(str(src_tmp), str(src))
-    ts = TrackerSettings(model_name=model, imgsz=imgsz, high_conf=high, start_conf=start, track_buffer_s=buffer_s,
-                         stride=stride, device=device, coast_s=coast, trail_s=trail, stabilize=stabilize)
-    ro = RenderOptions(blur_privacy=blur, privacy_level=level, show_trails=trail > 0, show_confidence=conf_show)
     prog = st.progress(0.0, text="Loading model...")
     try:
         tracker = RoadUserTracker(ts, ro)
     except Exception as e:
         shutil.rmtree(d, ignore_errors=True)
-        st.error(f"Could not load the model: {e}")
+        st.error(model_error(model, e))
         return
     writer = AnnotatedVideoWriter(str(d / "annotated.mp4"), m["fps"] / stride)
     preview = st.empty()
@@ -855,9 +935,11 @@ def page_results():
     c[2].metric("Candidate", int(sev.get("candidate", 0)))
     if blind_spot(meta):
         st.warning(blind_spot(meta))
+    for note in limit_notes(a):
+        st.warning(note)
     tabs = st.tabs([":material/map: Map & events", ":material/insights: Traffic & rates", ":material/pin_drop: Zones",
                     ":material/speed: Speeds", ":material/tune: Thresholds", ":material/slow_motion_video: Slow-motion video",
-                    ":material/download: Export"])
+                    ":material/fact_check: Data quality", ":material/download: Export"])
     with tabs[0]:
         l, r = st.columns([3, 2])
         with l:
@@ -892,13 +974,8 @@ def page_results():
                                     "events": sum(e["kind"] == k for e in events),
                                     "events per 1,000 pairs": rate(per_kind[k])} for k in per_kind]),
                      hide_index=True, width="stretch")
-        roi_note = (f"{stats['dropped_outside_roi']} outside the road area, " if load_roi(rid) else "")
-        st.caption(f"Tracks left out: {roi_note}{stats['dropped_riders']} riders (person on a bike counted once), "
-                   f"{stats['dropped_short']} too short (mostly flicker or duplicate boxes), "
-                   f"{stats['dropped_out_of_range']} out of range. Flags filtered out as likely false alarms: "
-                   f"{stats.get('filtered_duplicate_detection', 0)} one road user detected twice, "
-                   f"{stats.get('filtered_ttc_too_brief', 0)} too brief, {stats.get('filtered_no_evasive_action', 0)} "
-                   "driving past a stopped road user without braking.")
+        st.caption("Which tracks were left out, how well tracking and camera alignment went, and what each "
+                   "false-alarm filter removed: see the *Data quality* tab.")
     with tabs[2]:
         zones_ui(cal, tracks, events)
     with tabs[3]:
@@ -909,7 +986,60 @@ def page_results():
     with tabs[5]:
         slowmo_ui(S, events)
     with tabs[6]:
+        quality_ui(S, stats)
+    with tabs[7]:
         export_ui(S, stats, tracks, events)
+
+
+FILTERS = [("filtered_duplicate_detection", "One road user detected twice",
+            "Two boxes on the same road user look like a collision. Pairs closer than half their combined widths "
+            "are dropped."),
+           ("filtered_ttc_too_brief", "Collision course too brief",
+            "A predicted collision that lasted under 0.5 s: one noisy heading, not a real conflict."),
+           ("filtered_no_evasive_action", "Passing a stopped road user",
+            "Heading toward a parked or waiting road user, but no hard braking and no close pass: the straight-line "
+            "prediction was wrong (a curve, another lane).")]
+
+
+def quality_ui(S: Settings, stats: dict) -> None:
+    """Tracker quality, camera-motion alignment quality, and what each false-alarm filter removed."""
+    st.write("**Tracking**")
+    rows = [("Track IDs from the tracker", stats.get("raw_tracks", 0), ""),
+            ("Analysed road users", stats["analysed_tracks"], "long enough to measure"),
+            ("Too short", stats.get("dropped_short", 0), f"under {S.min_track_s:g} s: mostly flicker or duplicate boxes"),
+            ("Never moved (street furniture)", stats.get("dropped_static_clutter", 0),
+             f"a pedestrian, bike or motorcycle that never moved {S.static_clutter_boxes:g} of its own box sizes: "
+             "a lamp post, signal box or bin the model mistook for one"),
+            ("Outside the road area", stats.get("dropped_outside_roi", 0), "only if a road area is drawn"),
+            ("Out of range", stats.get("dropped_out_of_range", 0), "too far from the calibrated area"),
+            ("Riders merged", stats.get("dropped_riders", 0), "a person on a bike, counted once"),
+            ("Track breaks", stats.get("track_breaks", 0), "a track split by a detection gap"),
+            ("Likely ID switches", stats.get("likely_id_switches", 0),
+             "a track ends where a new one of the same kind starts within 1 s and 3 m (estimate)"),
+            ("Median track length (s)", stats.get("median_track_s", "-"), "")]
+    st.dataframe(pd.DataFrame(rows, columns=["", "count", "meaning"]), hide_index=True, width="stretch")
+    if stats["analysed_tracks"] and stats.get("likely_id_switches", 0) > 0.15 * stats["analysed_tracks"]:
+        st.warning("Many tracks look like one road user split into several. A conflict can then be counted twice or "
+                   "missed. Try a longer *Keep lost tracks* time on Detect.")
+    st.write("**Camera alignment**")
+    ms = (read_json(run_dir(rid) / "motion.json") or {}).get("summary")
+    if not ms:
+        st.caption("The camera was treated as fixed (no alignment).")
+    else:
+        rows = [("Frames", ms["frames"], ""),
+                ("Matched to the first frame", ms.get("direct_frames", ms["frames"] - ms["lost_frames"]), "most reliable"),
+                ("Matched through the previous frame", ms.get("chained_frames", "-"),
+                 "small errors can add up over many frames"),
+                ("Could not be lined up", ms["lost_frames"], "the previous alignment was reused"),
+                ("Largest camera movement (px)", ms["max_shift_px"], ""),
+                ("Median matched features", ms.get("median_inliers", "-"), "under 40 is weak")]
+        st.dataframe(pd.DataFrame(rows, columns=["", "count", "meaning"]).astype({"count": str}), hide_index=True,
+                     width="stretch")
+        if ms["lost_frames"] > 0.05 * max(ms["frames"], 1):
+            st.warning("More than 5% of frames could not be lined up. Positions there are less reliable.")
+    st.write("**False-alarm filters** (flags removed before you see them)")
+    st.dataframe(pd.DataFrame([(name, stats.get(k, 0), why) for k, name, why in FILTERS],
+                              columns=["filter", "flags removed", "why"]), hide_index=True, width="stretch")
 
 
 def zones_ui(cal, tracks, events) -> None:
@@ -1246,7 +1376,8 @@ AI_TEXT = """Fill this in honestly before you submit. Example structure:
 - Written by me: [which files / functions you wrote or rewrote yourself].
 - Pretrained models: YOLOv8 (Ultralytics, COCO classes) for street-level video, YOLO11-OBB (Ultralytics, trained on the
   DOTA aerial dataset; vehicles only) for drone video, and ByteTrack for tracking. I did not train them.
-  [If you used nearmiss-visdrone.pt: I fine-tuned YOLO on VisDrone with tools/train_visdrone_colab.ipynb.]
+  [If you used nearmiss-visdrone.pt: I fine-tuned YOLO11s for 30 epochs on the VisDrone dataset (Zhu et al., IEEE
+  TPAMI 2021) on Google Colab with tools/train_visdrone_colab.ipynb.]
 - Libraries: Streamlit, OpenCV, NumPy, pandas, Ultralytics.
 - I can explain: [calibration, TTC, closest approach, PET, validation]."""
 
@@ -1277,6 +1408,8 @@ def page_report():
                   icon=":material/fact_check:")
     if blind_spot(meta):
         st.warning(blind_spot(meta))
+    for note in limit_notes(a):
+        st.warning(note)
     tabs = st.tabs([":material/verified: Validation", ":material/tune: Tuning", ":material/group: Second reviewer",
                     ":material/edit_note: Recording details", ":material/shield: Privacy",
                     ":material/description: Build report"])
@@ -1292,6 +1425,7 @@ def page_report():
                 for k, v in summ["by_kind"].items()]), hide_index=True, width="stretch")
         with st.expander("All numbers"):
             st.json(summ)
+        all_recordings_ui()
     with tabs[1]:
         tuning_ui(S, events)
     with tabs[2]:
@@ -1304,6 +1438,45 @@ def page_report():
         build_report_ui(cal, S, det, tracks, stats, events, summ)
 
 
+def kind_rows(by_kind: dict) -> list:
+    return [{"type": KIND_LABEL.get(k, k), "flagged": v["flagged"], "real": v["tp"], "false alarms": v["fp"],
+             "unsure": v["unsure"], "not reviewed": v["unreviewed"],
+             "precision": "n/a" if v["precision"] is None else f"{v['precision']:.0%}"} for k, v in by_kind.items()]
+
+
+def all_recordings_ui() -> None:
+    """Validation over every reviewed real recording, so the submission can quote one set of numbers."""
+    st.write("**All recordings**")
+    st.caption("Every real (not synthetic) recording that is calibrated and has labels. Precision comes from the "
+               "summed counts, not an average of percentages. Each recording uses its own current thresholds.")
+    if not st.toggle("Compute it", key="all_val"):
+        return
+    rows, summs = [], []
+    for r, label in list_runs():
+        m = read_json(run_dir(r) / "meta.json") or {}
+        store = read_json(run_dir(r) / "labels.json", {})
+        if m.get("synthetic") or not (store.get("events") or store.get("missed")):
+            continue
+        a = get_analysis(r)
+        if a is None:
+            continue
+        s = validation.summarize(a[5], store)
+        summs.append(s)
+        rows.append({"recording": label, "flagged": s["events_flagged"], "real": s["tp"], "false alarms": s["fp"],
+                     "unsure": s["unsure"], "not reviewed": s["unreviewed"], "missed": s["missed"],
+                     "precision": "n/a" if s["precision"] is None else f"{s['precision']:.0%}"})
+    if not rows:
+        st.info("No reviewed real recordings yet. Label events on Event Review first.")
+        return
+    tot = validation.combine(summs)
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    pct = lambda v: "n/a" if v is None else f"{v:.0%}"
+    st.write(f"Total over {tot['recordings']} recording(s): {tot['events_flagged']} flagged, {tot['tp']} real, "
+             f"{tot['fp']} false alarms, {tot['unreviewed']} not reviewed, {tot['missed']} missed. Precision "
+             f"{pct(tot['precision'])}, recall at most {pct(tot['recall_upper_bound'])}.")
+    st.dataframe(pd.DataFrame(kind_rows(tot["by_kind"])), hide_index=True, width="stretch")
+
+
 def build_report_ui(cal, S, det, tracks, stats, events, summ) -> None:
     _, cd = load_calibration(rid)
     disclosure = st.text_area("AI-use disclosure (the Congressional App Challenge requires it)", AI_TEXT, height=200)
@@ -1313,7 +1486,8 @@ def build_report_ui(cal, S, det, tracks, stats, events, summ) -> None:
                                  {k: cd[k] for k in ("width_m", "length_m", "input", "checks") if k in cd}, S, events, summ,
                                  disclosure, png_b64(topdown_map(tracks, events, cal, zones=zone_overlays(cal))),
                                  frames,
-                                 notes=[n.replace("**", "") for n in [blind_spot(meta)] if n],
+                                 notes=[n.replace("**", "") for n in [blind_spot(meta)] if n]
+                                       + limit_notes((cal, S, det, tracks, stats, events)),
                                  exposure={k: stats[k] for k in ("road_users", "pairs_together", "events_per_100_vehicles",
                                                                  "events_per_1000_pairs",
                                                                  "events_per_1000_pairs_by_kind", "events_per_hour")},
@@ -1468,10 +1642,12 @@ def page_method():
     page_header("Method", "Method and limits")
     st.markdown("""
 **Pipeline.** For street-level cameras a pretrained YOLOv8 model (COCO) finds people, bicycles, motorcycles, cars,
-buses and trucks. For drone footage a pretrained aerial model (YOLO11-OBB, trained on the DOTA aerial dataset) finds
-vehicles seen from above; it has no pedestrian or bicycle class. A model trained on VisDrone (hand-labelled drone
-images, see tools/train_visdrone_colab.ipynb) also finds pedestrians and bikes from above. Each track keeps one class
-label, which only changes when another class clearly outvotes it, so labels do not flicker. ByteTrack links detections into tracks. Boxes that go
+buses and trucks. For drone footage the default is a pretrained aerial model (YOLO11-OBB, trained on the DOTA aerial
+dataset), which finds vehicles seen from above and has no pedestrian or bicycle class; car or truck is decided by
+vehicle length. A YOLO11s fine-tuned on VisDrone (hand-labelled drone images, see tools/train_visdrone_colab.ipynb)
+also finds pedestrians and bikes from above, but mistakes some street furniture for them. Real pedestrians and riders
+move, so one that never moves more than 3 of its own box sizes is dropped (and hidden in the drone video). Each track
+keeps one class label, which only changes when another class clearly outvotes it, so labels do not flicker. ByteTrack links detections into tracks. Boxes that go
 missing for a moment are carried forward (dashed) so they do not flicker. Only real detections are saved.
 
 **Moving camera.** If the camera drifts or zooms (a hovering drone does both), every frame is lined up with the first

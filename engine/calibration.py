@@ -204,6 +204,20 @@ class Calibration:
         ratio = max(self.width_m, self.length_m) / min(self.width_m, self.length_m)
         if ratio > 12:
             hints.append("The rectangle is very long and thin; a squarer one is better conditioned.")
+        if not check_shape:                     # one known distance: the clicked segment is side 1-2 of the square
+            seg = float(np.linalg.norm(self.image_points[1] - self.image_points[0]))
+            if seg < 0.15 * math.hypot(fw, fh):
+                hints.append("The two points are close together compared with the frame (%.0f pixels). A longer known "
+                             "distance is more accurate." % seg)
+        # the bottom of the frame is road for any usable camera; if it maps past the horizon or very far away,
+        # the points or the lengths are wrong (or the two side lengths are swapped)
+        g, ok = self.img_to_ground([[0.1 * fw, 0.95 * fh], [0.5 * fw, 0.95 * fh], [0.9 * fw, 0.95 * fh]])
+        with np.errstate(invalid="ignore"):
+            far = (~ok) | (np.linalg.norm(g - [self.width_m / 2, self.length_m / 2], axis=1) > 300)
+        if far.any():
+            hints.append("The bottom of the frame lands above the horizon or hundreds of metres away with this "
+                         "calibration. The points are probably not the corners of a real rectangle on the road, or "
+                         "the two side lengths are swapped.")
         return hints
 
     def _shape_hints(self, min_side_px: float = 40.0, min_angle_deg: float = 30.0,

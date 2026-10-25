@@ -33,10 +33,17 @@ Click **Load synthetic demo** in the sidebar to try every page without footage.
 The stock aerial model misses some moving cars and finds no pedestrians or bikes. To train a better one:
 1. Open `tools/train_visdrone_colab.ipynb` in Google Colab (colab.research.google.com -> Upload).
 2. Runtime -> Change runtime type -> T4 GPU, then Runtime -> Run all. About 2-3 hours.
-3. Put the downloaded `nearmiss-visdrone.pt` next to `app.py`. It appears first in the overhead model list.
+3. Put the downloaded `nearmiss-visdrone.pt` next to `app.py`. It appears second in the overhead model list; the
+   stock model stays the default.
 4. Check it beats the old model on your own clip before relying on it:
    `python tools/compare_models.py your_clip.mp4 compare_out yolo11n-obb.pt nearmiss-visdrone.pt`
 VisDrone: Zhu et al., "Detection and Tracking Meet Drones Challenge", IEEE TPAMI 2021 (hand-labelled drone images).
+
+How the two compared on our drone clip (30 epochs, val mAP50 0.49): the VisDrone model tracked more road users
+(67 vs 48) but flipped car/truck labels more (11 vs 1), and called lamp posts, signal boxes and a utility cabinet
+"pedestrian" or "motorcycle". None of those ever moves, so pedestrians, bikes and motorcycles that never move more
+than 3 of their own box sizes are dropped from the analysis and hidden in the drone video. Real riders on other
+clips moved 7-11 box sizes; the furniture at most 1.4. Results -> Data quality shows how many were dropped.
 
 - Aerial models find vehicles only, so the app warns that pedestrian and bicycle conflicts were **not measured**
   (zero is a blind spot, not a safe result), and privacy blur covers each whole road user.
@@ -101,7 +108,8 @@ GitHub Actions runs the tests on every push (`.github/workflows/tests.yml`).
 Detection uses pretrained models I did not train:
 - **Street-level video:** YOLOv8 (Ultralytics, COCO classes: person, bicycle, motorcycle, car, bus, truck).
 - **Drone video:** YOLO11-OBB (Ultralytics, trained on the DOTA aerial dataset). Vehicles only.
-- **Optional:** `nearmiss-visdrone.pt`, fine-tuned on VisDrone with `tools/train_visdrone_colab.ipynb`.
+- **Optional:** `nearmiss-visdrone.pt`, a YOLO11s we fine-tuned for 30 epochs on VisDrone with
+  `tools/train_visdrone_colab.ipynb` on Google Colab.
 - **Tracking:** ByteTrack.
 
 Write down which parts you wrote yourself and where AI helped; the Report page has a template.

@@ -11,6 +11,7 @@ Steps
    window. We do NOT differentiate frame to frame: a pixel of detector jitter
    becomes a huge speed spike that way (noise is amplified by 1/dt).
 6. Remove riders that the detector reports as a separate "person" on a bicycle.
+7. Drop "pedestrians" and "bikes" that never move: street furniture the model mistook for one.
 """
 from __future__ import annotations
 
@@ -186,6 +187,33 @@ def ground_pixels(boxes: np.ndarray, mode: str = "bottom") -> np.ndarray:
     return np.c_[cx, y]
 
 
+STILL_CLASSES = ("pedestrian", "bicycle", "motorcycle")
+
+
+def is_still(boxes: np.ndarray, frames: np.ndarray, motion: Optional[Dict[int, np.ndarray]], max_boxes: float) -> bool:
+    """True when a track's box centre never moves more than `max_boxes` of its own (median) box size, in
+    reference-frame pixels. Scale-free, so a wrong calibration cannot hide or create movement."""
+    centres = to_reference(np.c_[(boxes[:, 0] + boxes[:, 2]) / 2, (boxes[:, 1] + boxes[:, 3]) / 2], frames, motion)
+    size = float(np.median(np.maximum(boxes[:, 2] - boxes[:, 0], boxes[:, 3] - boxes[:, 1])))
+    return float(np.linalg.norm(np.ptp(centres, axis=0))) < max_boxes * max(size, 1.0)
+
+
+def likely_id_switches(tracks: List[Track], max_gap_s: float = 1.0, max_dist_m: float = 3.0) -> int:
+    """Tracks that end where another track of the same kind starts a moment later: most likely one road user
+    whose ID changed (the tracker lost it and started a new track). An estimate, not a count of real switches."""
+    n = 0
+    for a in tracks:
+        end_t, end_p = a.t[-1], a.xy[-1]
+        for b in tracks:
+            if b is a or b.group != a.group:
+                continue
+            gap = b.t[0] - end_t
+            if 0 < gap <= max_gap_s and np.linalg.norm(b.xy[0] - (end_p + a.v[-1] * gap)) <= max_dist_m:
+                n += 1
+                break
+    return n
+
+
 def build_tracks(det: Detections, calib: Calibration, S: Settings,
                  motion: Optional[Dict[int, np.ndarray]] = None,
                  roi: Optional[np.ndarray] = None) -> Tuple[List[Track], Dict]:
@@ -195,7 +223,7 @@ def build_tracks(det: Detections, calib: Calibration, S: Settings,
     half = max(1, int(round(S.smooth_window_s / dt / 2.0)))
     riders = find_rider_tracks(det)
     stats = {"raw_tracks": len(det.track_ids()), "dropped_riders": len(riders), "dropped_short": 0,
-             "dropped_out_of_range": 0, "dropped_outside_roi": 0}
+             "dropped_out_of_range": 0, "dropped_outside_roi": 0, "dropped_static_clutter": 0, "track_breaks": 0}
     tracks: List[Track] = []
     center = calib.center_map
     for tid in det.track_ids():
@@ -218,6 +246,10 @@ def build_tracks(det: Detections, calib: Calibration, S: Settings,
         if valid.sum() < S.min_hits:
             stats["dropped_out_of_range" if len(idx) >= S.min_hits else "dropped_short"] += 1
             continue
+        if S.static_clutter_boxes > 0 and cls in STILL_CLASSES and is_still(boxes, det.frame[idx], motion,
+                                                                            S.static_clutter_boxes):
+            stats["dropped_static_clutter"] += 1      # never moved: a pole or a box, not a person
+            continue
         t, mp = det.t[idx][valid], mp[valid]
         cuts = [0] + list(np.flatnonzero(np.diff(t) > S.max_gap_s) + 1) + [len(t)]
         made = False
@@ -232,8 +264,11 @@ def build_tracks(det: Detections, calib: Calibration, S: Settings,
             pos, vel = local_linear(tg, pg, half)
             speed = np.linalg.norm(vel, axis=1)
             tracks.append(Track(tid, seg, cls, CLASS_GROUP[cls], k0, tg, pos, vel, speed, len(ts)))
+            stats["track_breaks"] += made
             made = True
         if not made:
             stats["dropped_short"] += 1
     stats["tracks"] = len(tracks)
+    stats["likely_id_switches"] = likely_id_switches(tracks)
+    stats["median_track_s"] = round(float(np.median([t.t[-1] - t.t[0] for t in tracks])), 1) if tracks else 0.0
     return tracks, stats
