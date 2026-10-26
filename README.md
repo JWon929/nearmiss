@@ -70,6 +70,6 @@ Detection uses pretrained models I did not train:
 - **Optional:** `nearmiss-visdrone.pt`, a YOLO11s we fine-tuned for 30 epochs on VisDrone with
   `tools/train_visdrone_colab.ipynb` on Google Colab.
 - **Tracking:** ByteTrack.
--**AI Usage**
+- **AI Usage**
    - Models utilized AI for detection
    - Helped with the aesthetics and UI of the website/app
