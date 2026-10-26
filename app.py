@@ -680,6 +680,10 @@ with st.sidebar:
             st.session_state["rid"] = ids[0]
         st.session_state["rec_pick"] = st.session_state["rid"]
         st.selectbox("Recording", ids, key="rec_pick", format_func=lambda i: dict(runs)[i], on_change=pick_recording)
+    if "_url_page" not in st.session_state:               # a link like ?page=event-review opens that page first
+        st.session_state["_url_page"] = True
+        want = st.query_params.get("page", "").replace("-", " ").lower()
+        st.session_state["page"] = next((p for p in PAGES if p.lower() == want), st.session_state.get("page"))
     if st.session_state.get("page") not in PAGES:
         st.session_state["page"] = "Home"
     page = st.session_state["page"]
