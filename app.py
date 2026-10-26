@@ -17,6 +17,7 @@ import csv
 import hashlib
 import io
 import json
+import os
 import platform
 import shutil
 import time
@@ -58,10 +59,13 @@ TRASH = RUNS / ".trash"
 CSV_HEADER = ["frame", "time_s", "track_id", "class_name", "confidence", "x1", "y1", "x2", "y2", "center_x", "center_y"]
 DISPLAY_W = 900
 STEPS = ["Detect", "Calibrate", "Results", "Event Review", "Report"]
-PAGES = STEPS + ["Proposed designs", "Method"]
+PAGES = STEPS + ["Proposed designs", "Method", "Help & contact"]
 PAGE_ICONS = {"Detect": ":material/videocam:", "Calibrate": ":material/straighten:", "Results": ":material/analytics:",
               "Event Review": ":material/fact_check:", "Report": ":material/description:",
-              "Proposed designs": ":material/architecture:", "Method": ":material/menu_book:"}
+              "Proposed designs": ":material/architecture:", "Method": ":material/menu_book:",
+              "Help & contact": ":material/support_agent:"}
+INQUIRIES = Path(__file__).parent / "inquiries"          # questions and feedback typed into the app (git-ignored)
+PREFS_FILE = Path(__file__).parent / "preferences.json"   # this computer's defaults (git-ignored)
 LABEL_TEXT = {"tp": "Real near miss", "fp": "False alarm", "unsure": "Unsure"}
 SEV_HEX = {"serious": "#c62828", "moderate": "#ef6c00", "candidate": "#b28704", "none": "#6b7280"}
 LEVEL_HEX = {"good": "#2e7d32", "unchecked": "#b28704", "problem": "#c62828"}
@@ -69,6 +73,51 @@ GROUP_NAME = {"ped": "Pedestrians", "bike": "Bicycles", "veh": "Vehicles"}
 
 st.set_page_config(page_title="NearMiss", page_icon=":material/traffic:", layout="wide")
 st.markdown("""<style>
+/* ---- base: system fonts only (no web requests), calmer spacing ---- */
+html, body, [class*="st-"], .stMarkdown, button, input, textarea {
+  font-family: "Segoe UI Variable", "Segoe UI", Inter, -apple-system, BlinkMacSystemFont, Roboto, "Helvetica Neue",
+               Arial, sans-serif;}
+[data-testid="stIconMaterial"], [data-testid="stExpanderIcon"], [data-testid*="IconMaterial"],
+span[data-testid$="Icon"], .material-symbols-rounded {
+  font-family: "Material Symbols Rounded" !important;}          /* keep Streamlit's icon font */
+.block-container {padding-top: 1.6rem; max-width: 1280px;}
+h1, h2, h3 {letter-spacing: -.01em;}
+/* ---- page hero ---- */
+.nm-hero {position: relative; overflow: hidden; border-radius: 16px; padding: 18px 22px 16px 22px; margin: 0 0 14px 0;
+  background: linear-gradient(120deg, rgba(31,95,191,.16) 0%, rgba(31,95,191,.06) 45%, rgba(0,150,136,.10) 100%);
+  border: 1px solid rgba(31,95,191,.22);}
+.nm-hero:after {content: ""; position: absolute; right: -60px; top: -60px; width: 220px; height: 220px;
+  border-radius: 50%; background: radial-gradient(circle, rgba(31,95,191,.18), rgba(31,95,191,0) 70%);}
+.nm-hero .row {display: flex; align-items: center; gap: 14px;}
+.nm-hero .icon {flex: 0 0 auto; width: 46px; height: 46px; border-radius: 12px; display: flex; align-items: center;
+  justify-content: center; font-size: 26px; background: #1f5fbf; color: #fff; box-shadow: 0 4px 14px rgba(31,95,191,.35);
+  font-family: "Material Symbols Rounded"; font-feature-settings: "liga";}
+.nm-hero h1 {font-size: 1.75rem; font-weight: 700; margin: 0; padding: 0; line-height: 1.2;}
+.nm-hero .intro {opacity: .82; margin-top: 6px; max-width: 900px; font-size: .97rem;}
+.nm-hero .pill {display: inline-block; font-size: .72rem; font-weight: 700; letter-spacing: .08em;
+  text-transform: uppercase; color: #1f5fbf; background: rgba(31,95,191,.12); border-radius: 999px; padding: 2px 9px;
+  margin-bottom: 4px;}
+.nm-steps {display: flex; gap: 4px; margin-top: 12px;}
+.nm-steps span {flex: 1; height: 5px; border-radius: 3px; background: rgba(128,128,128,.22);}
+.nm-steps span.on {background: #1f5fbf;}
+.nm-steps span.done {background: rgba(31,95,191,.45);}
+/* ---- sidebar brand ---- */
+.nm-brand {display: flex; align-items: center; gap: 10px; margin: -6px 0 6px 0;}
+.nm-brand .logo {width: 38px; height: 38px; border-radius: 10px; background: linear-gradient(135deg, #1f5fbf, #00897b);
+  display: flex; align-items: center; justify-content: center; color: #fff; font-family: "Material Symbols Rounded";
+  font-size: 24px; box-shadow: 0 3px 10px rgba(31,95,191,.35);}
+.nm-brand .name {font-size: 1.3rem; font-weight: 750; letter-spacing: -.01em; line-height: 1.1;}
+.nm-brand .tag {font-size: .74rem; opacity: .7;}
+/* ---- cards, tabs, buttons ---- */
+div[data-testid="stVerticalBlockBorderWrapper"] {border-radius: 14px !important;}
+div[data-testid="stExpander"] details {border-radius: 12px;}
+button[kind="primary"], button[kind="secondary"] {border-radius: 10px !important; font-weight: 600 !important;}
+button[kind="primary"] {box-shadow: 0 3px 10px rgba(31,95,191,.25);}
+div[data-baseweb="tab-list"] {gap: 2px;}
+button[data-baseweb="tab"] {border-radius: 10px 10px 0 0; padding: 6px 12px;}
+.nm-footer {margin-top: 28px; padding-top: 10px; border-top: 1px solid rgba(128,128,128,.2); font-size: .78rem;
+  opacity: .65;}
+.nm-faq-q {font-weight: 600;}
 div[data-testid="stMetric"] {border: 1px solid rgba(128,128,128,.25); border-radius: 10px; padding: 8px 12px;
   background: rgba(128,128,128,.04);}
 div[data-testid="stMetricLabel"] p {font-size: .82rem; opacity: .8;}
@@ -82,8 +131,9 @@ div[data-testid="stMetricLabel"] p {font-size: .82rem; opacity: .8;}
   white-space: nowrap;}
 .nm-chip b {font-weight: 600;}
 .nm-kpis {display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 10px 0;}
-.nm-kpi {flex: 1 1 105px; border: 1px solid rgba(128,128,128,.25); border-radius: 10px; padding: 6px 10px;
-  background: rgba(128,128,128,.04); min-width: 0;}
+.nm-kpi {flex: 1 1 105px; border: 1px solid rgba(128,128,128,.22); border-radius: 12px; padding: 8px 12px;
+  background: linear-gradient(180deg, rgba(31,95,191,.06), rgba(128,128,128,.02)); min-width: 0;
+  box-shadow: 0 1px 2px rgba(0,0,0,.04);}
 .nm-kpi .v {font-size: 1.25rem; font-weight: 650; line-height: 1.3; overflow-wrap: anywhere;}
 .nm-kpi .l {font-size: .74rem; opacity: .75;}
 .nm-stats {display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 6px; margin: 6px 0;}
@@ -96,12 +146,19 @@ section[data-testid="stSidebar"] div[role="radiogroup"] label {padding: 2px 0;}
 
 # ------------------------------------------------------------------ small UI pieces
 def page_header(page: str, title: str, intro: str = "") -> None:
-    """Step number, title and a one-line explanation, the same on every page."""
+    """The banner at the top of every page: icon, step number, title, a one-line explanation and step progress."""
+    icon = PAGE_ICONS.get(page, ":material/info:").split("/")[-1].strip(":")
+    pill = f"<div class='pill'>Step {STEPS.index(page) + 1} of {len(STEPS)}</div>" if page in STEPS else \
+        "<div class='pill'>Guide</div>"
+    bars = ""
     if page in STEPS:
-        st.markdown(f"<div class='nm-step'>Step {STEPS.index(page) + 1} of {len(STEPS)}</div>", unsafe_allow_html=True)
-    st.title(title)
-    if intro:
-        st.markdown(f"<div class='nm-intro'>{intro}</div>", unsafe_allow_html=True)
+        done = steps_done(st.session_state.get("rid")) if st.session_state.get("rid") else {}
+        bars = "<div class='nm-steps'>" + "".join(
+            f"<span class='{'on' if p == page else ('done' if done.get(p) else '')}' title='{p}'></span>"
+            for p in STEPS) + "</div>"
+    intro_html = f"<div class='intro'>{intro}</div>" if intro else ""
+    st.markdown(f"<div class='nm-hero'><div class='row'><div class='icon'>{icon}</div><div>{pill}<h1>{html_escape(title)}"
+                f"</h1></div></div>{intro_html}{bars}</div>", unsafe_allow_html=True)
 
 
 def badge(severity: str, provisional: bool = False) -> str:
@@ -478,8 +535,9 @@ def clean_interrupted() -> int:
 
 
 with st.sidebar:
-    st.markdown("## :material/traffic: NearMiss")
-    st.caption("Screening tool for potential traffic conflicts. Not a crash predictor.")
+    st.markdown("<div class='nm-brand'><div class='logo'>traffic</div><div><div class='name'>NearMiss</div>"
+                "<div class='tag'>Traffic conflict screening</div></div></div>", unsafe_allow_html=True)
+    st.caption("Finds where road users came close. Not a crash predictor.")
     if "_cleaned" not in st.session_state:
         st.session_state["_cleaned"] = clean_interrupted()
     all_runs = list_runs()
@@ -511,7 +569,9 @@ with st.sidebar:
     trash_ui()
     if st.session_state.get("_cleaned"):
         st.caption(f"Removed {st.session_state['_cleaned']} unfinished run folder(s) left by a stopped detection.")
-    st.caption("All processing happens on this computer. Footage is not uploaded anywhere.")
+    st.caption(":material/lock: All processing happens on this computer. Footage is not uploaded anywhere.")
+    st.button("Help, questions & feedback", icon=":material/support_agent:", on_click=go, args=("Help & contact",),
+              width="stretch", key="sb_help")
 
 rid, meta = current()
 
@@ -657,6 +717,10 @@ def page_detect():
                 "drone). If the camera drifts or zooms, NearMiss lines every frame up with the first one.")
     damaged_files_ui()
     prewarm_detector()
+    if load_prefs().get("tips", True) and not list_runs():
+        st.info("**New here?** 1) Upload an intersection clip below and press Run. 2) Calibrate with a rectangle you "
+                "know the size of. 3) Look at Results, then review each flag. Or try *Load synthetic demo* in the "
+                "sidebar first. Tips can be turned off under Help & contact > Preferences.", icon=":material/lightbulb:")
     unfinished_ui()
     ups = st.file_uploader("Intersection video(s)", type=["mp4", "mov", "m4v"], accept_multiple_files=True,
                            help="Choose several clips to process them one after another, each as its own recording.")
@@ -682,11 +746,14 @@ def page_detect():
                              help="Bigger finds smaller or farther road users but is slower. "
                                   "For overhead models 960 works best: bigger sizes start calling cars 'large vehicles'.")
     devices = ["auto", "cpu"] + [f"intel:{d.lower()}" for d in ("GPU", "NPU") if d in intel_devices()] + ["mps", "cuda:0"]
-    device = c3.selectbox("Device", devices, format_func=lambda d: f"auto ({device_label(pick_device('auto'))})"
+    prefs = load_prefs()
+    device = c3.selectbox("Device", devices, index=devices.index(prefs["device"]) if prefs.get("device") in devices else 0,
+                          format_func=lambda d: f"auto ({device_label(pick_device('auto'))})"
                           if d == "auto" else device_label(d),
                           help="auto picks the fastest one found: an NVIDIA GPU, an Apple chip, or an Intel GPU "
                                "(through OpenVINO, about 4x faster than the CPU on an Intel Arc laptop chip).")
-    speed = st.radio("Speed", list(SPEED_MODES), index=1, horizontal=True, key="det_speed",
+    speed = st.radio("Speed", list(SPEED_MODES), horizontal=True, key="det_speed",
+                     index=list(SPEED_MODES).index(prefs["speed"]) if prefs.get("speed") in SPEED_MODES else 1,
                      format_func=lambda k: SPEED_MODES[k]["label"],
                      help="How many frames per second are analysed, and whether the tracked video of the whole clip "
                           "is drawn during detection. Event clips are always available: without the tracked video "
@@ -2756,5 +2823,233 @@ Anything the detector misses is not blurred. If blur was turned off at detection
 """)
 
 
+# ================================================================== HELP & CONTACT
+INQUIRY_TYPES = {"question": "Ask a question", "problem": "Report a problem", "idea": "Suggest a feature",
+                 "privacy": "Privacy or data request", "other": "Something else"}
+FAQ = [
+    ("Is my footage uploaded anywhere?",
+     "No. Detection, analysis and reports all run on this computer. Nothing is sent unless you choose to email or "
+     "share a file yourself. The original video stays in the app's runs folder; Report > Privacy can delete it."),
+    ("How long will a video take?",
+     "On a laptop with an Intel Arc GPU, about 6x faster than real time in Fast mode (a 60-min clip in ~10 min) and "
+     "about 15x in Fastest mode. On a computer without a graphics chip it is slower than real time. Keep a laptop "
+     "plugged in: on a low battery Windows slows the GPU down a lot."),
+    ("Which speed mode should I use?",
+     "Fast for anything you report: it finds exactly the same road users as Full, it just does not draw the tracked "
+     "video of the whole clip. Fastest skips more frames and misses some road users, especially pedestrians; use it "
+     "to scan long footage first."),
+    ("Why does drone footage show no pedestrian conflicts?",
+     "The standard aerial model only knows vehicles. Zero pedestrian conflicts there means 'not measured', not "
+     "'safe'. The VisDrone model (nearmiss-visdrone.pt) finds pedestrians and bikes from above."),
+    ("Why are my severities marked provisional?",
+     "Every distance and speed depends on the calibration. Until a second known distance has been checked on "
+     "Calibrate (or when it is more than 10% off), severities are provisional."),
+    ("What do TTC, PET and DRAC mean?",
+     "TTC (time to collision): seconds until two road users would touch if neither changed course. PET (post-"
+     "encroachment time): the gap between one leaving a crossing point and the other reaching it. DRAC: how hard "
+     "someone would have needed to brake to avoid the collision. The Method page explains each."),
+    ("A detection stopped or my computer turned off. Is the work lost?",
+     "No. Progress is saved every 30 s of video. The unfinished run is listed at the top of Detect with Resume."),
+    ("Does a flagged event mean a crash almost happened?",
+     "Not necessarily. Each flag is a measurement that needs a human look; that is what Event Review is for. "
+     "Precision on the Report page says how many of your reviewed flags were real."),
+]
+
+
+def load_prefs() -> dict:
+    return read_json(PREFS_FILE, {}) or {}
+
+
+def save_prefs(p: dict) -> None:
+    PREFS_FILE.write_text(json.dumps(p, indent=1))
+
+
+def app_version() -> str:
+    """The git commit the app runs from (best effort; 'unknown' outside a git checkout)."""
+    try:
+        head = (Path(__file__).parent / ".git" / "HEAD").read_text().strip()
+        if head.startswith("ref:"):
+            ref = Path(__file__).parent / ".git" / head.split(" ", 1)[1]
+            return f"{head.rsplit('/', 1)[-1]} @ {ref.read_text().strip()[:7]}" if ref.exists() else head
+        return head[:7]
+    except Exception:
+        return "unknown"
+
+
+def diagnostics() -> dict:
+    """What helps someone answer a problem report. No footage, no file names, no labels."""
+    from detector_tracker import intel_devices as _intel
+
+    d = {"app_version": app_version(), "python": platform.python_version(), "os": platform.platform(terse=True),
+         "streamlit": st.__version__, "detection_device": device_label(pick_device("auto")),
+         "intel_devices": _intel(), "page_before": st.session_state.get("_last_page")}
+    if rid and meta:
+        d["recording"] = {k: meta.get(k) for k in ("view", "model_used", "device_used", "stride", "fps", "width",
+                                                    "height", "duration_s", "detection_rows", "seconds", "resumed")}
+        d["recording"]["calibrated"] = (run_dir(rid) / "calibration.json").exists()
+    return d
+
+
+def contact_email() -> str:
+    try:
+        sec = st.secrets.get("contact_email", "")
+    except Exception:
+        sec = ""
+    return load_prefs().get("contact_email") or os.environ.get("NEARMISS_CONTACT_EMAIL", "") or sec
+
+
+def inquiry_text(q: dict) -> str:
+    lines = [f"NearMiss inquiry: {INQUIRY_TYPES.get(q['type'], q['type'])}", f"From: {q.get('name') or '(no name)'}"
+             + (f" <{q['email']}>" if q.get("email") else ""), f"Sent: {q['created_text']}", "", q["message"]]
+    if q.get("diagnostics"):
+        lines += ["", "--- diagnostics ---", json.dumps(q["diagnostics"], indent=1)]
+    return "\n".join(lines)
+
+
+def page_help():
+    page_header("Help & contact", "Help, questions & feedback",
+                "Quick answers, a way to ask the team something or report a problem, and your preferences.")
+    tabs = st.tabs([":material/rocket_launch: Quick start", ":material/quiz: FAQ", ":material/mail: Contact the team",
+                    ":material/inbox: Inquiries", ":material/settings: Preferences"])
+    with tabs[0]:
+        steps = [("videocam", "Detect", "Upload a clip (or several) and press Run. Fast mode is a good default."),
+                 ("straighten", "Calibrate", "Click four corners of a rectangle you know the size of, then check a "
+                                             "second known distance."),
+                 ("analytics", "Results", "See the flagged events on the map, the rates, zones, speeds and movements."),
+                 ("fact_check", "Event Review", "Watch each flag and mark it real, false alarm or unsure."),
+                 ("description", "Report", "Precision, a second reviewer, and a report to share.")]
+        cols = st.columns(len(steps))
+        for col, (icon, name, text) in zip(cols, steps):
+            with col.container(border=True):
+                st.markdown(f"<div style='font-family:\"Material Symbols Rounded\";font-size:28px;color:#1f5fbf'>"
+                            f"{icon}</div><b>{name}</b>", unsafe_allow_html=True)
+                st.caption(text)
+                st.button("Open", key=f"qs_{name}", on_click=go, args=(name,), width="stretch")
+        st.caption("No footage yet? Click *Load synthetic demo* in the sidebar to try every page with a scripted scene.")
+    with tabs[1]:
+        search = st.text_input("Search the questions", placeholder="e.g. battery, drone, provisional", key="faq_q")
+        shown = [(q, a) for q, a in FAQ if not search or search.lower() in (q + a).lower()]
+        for q, a in shown:
+            with st.expander(q):
+                st.write(a)
+        if not shown:
+            st.info("Nothing matches. Ask the team on the *Contact the team* tab.")
+    with tabs[2]:
+        contact_form()
+    with tabs[3]:
+        inbox_ui()
+    with tabs[4]:
+        preferences_ui()
+
+
+def contact_form() -> None:
+    st.write("Questions, problems, ideas, or a request about data you appear in. Your message is **saved on this "
+             "computer**; nothing is sent until you choose to email it or share the file.")
+    with st.form("inquiry", clear_on_submit=True):
+        a, b = st.columns(2)
+        kind = a.selectbox("What is it about?", list(INQUIRY_TYPES), format_func=INQUIRY_TYPES.get)
+        name = b.text_input("Your name (optional)")
+        email = a.text_input("Your email, if you want an answer (optional)")
+        subject = b.text_input("Subject", max_chars=120)
+        message = st.text_area("Message", height=160, max_chars=4000,
+                               placeholder="What happened, what you expected, and which recording or page it was on.")
+        diag = st.checkbox("Attach technical details (app version, device, settings of the open recording; no "
+                           "footage, no file names)", value=kind == "problem")
+        sent = st.form_submit_button("Save message", type="primary", icon=":material/send:")
+    if sent:
+        if not message.strip():
+            st.error("Please write a message.")
+            return
+        if email and "@" not in email:
+            st.error("That email address does not look right.")
+            return
+        INQUIRIES.mkdir(exist_ok=True)
+        now = time.time()
+        q = {"id": time.strftime("%Y%m%d-%H%M%S", time.localtime(now)) + "-" + uuid.uuid4().hex[:4], "type": kind,
+             "name": name.strip(), "email": email.strip(), "subject": subject.strip() or INQUIRY_TYPES[kind],
+             "message": message.strip(), "created": now,
+             "created_text": time.strftime("%Y-%m-%d %H:%M", time.localtime(now)), "status": "open",
+             "diagnostics": diagnostics() if diag else None}
+        write_json(INQUIRIES / f"{q['id']}.json", q)
+        st.session_state["_last_inquiry"] = q["id"]
+    last = st.session_state.get("_last_inquiry")
+    q = read_json(INQUIRIES / f"{last}.json") if last else None
+    if q:
+        st.success("Saved. To get it to the team, email it or send the file:")
+        a, b = st.columns(2)
+        to = contact_email()
+        if to:
+            from urllib.parse import quote
+
+            a.link_button(f"Email it to {to}", f"mailto:{to}?subject={quote('NearMiss: ' + q['subject'])}"
+                                                f"&body={quote(inquiry_text(q)[:1800])}", icon=":material/mail:")
+        else:
+            a.caption("No team email is set yet: add one under *Preferences*.")
+        b.download_button("Download as a text file", inquiry_text(q), f"nearmiss_inquiry_{q['id']}.txt",
+                          icon=":material/download:")
+
+
+def inbox_ui() -> None:
+    """Messages saved on this computer, newest first, with a status so the team can keep track of them."""
+    items = sorted([read_json(p, {}) for p in INQUIRIES.glob("*.json")] if INQUIRIES.exists() else [],
+                   key=lambda q: -q.get("created", 0))
+    items = [q for q in items if q.get("id")]
+    if not items:
+        st.info("No messages saved on this computer yet.")
+        return
+    a, b = st.columns([2, 1])
+    show = a.segmented_control("Show", ["open", "answered", "all"], default="open", key="inbox_show")
+    open_n = sum(q.get("status") == "open" for q in items)
+    b.metric("Open", open_n)
+    for q in items:
+        if show and show != "all" and q.get("status") != show:
+            continue
+        icon = {"open": ":material/mark_email_unread:", "answered": ":material/mark_email_read:"}.get(q["status"], "")
+        with st.expander(f"{q['created_text']} · {INQUIRY_TYPES.get(q['type'], q['type'])} · {q['subject']}",
+                         icon=icon or None):
+            st.write(q["message"])
+            st.caption(f"From {q.get('name') or '(no name)'}" + (f" · {q['email']}" if q.get("email") else ""))
+            if q.get("diagnostics"):
+                st.json(q["diagnostics"], expanded=False)
+            c1, c2, c3 = st.columns(3)
+            if q["status"] == "open" and c1.button("Mark answered", key=f"ans_{q['id']}"):
+                q["status"] = "answered"
+                write_json(INQUIRIES / f"{q['id']}.json", q)
+                st.rerun()
+            if q["status"] != "open" and c1.button("Reopen", key=f"reo_{q['id']}"):
+                q["status"] = "open"
+                write_json(INQUIRIES / f"{q['id']}.json", q)
+                st.rerun()
+            c2.download_button("Download", inquiry_text(q), f"nearmiss_inquiry_{q['id']}.txt", key=f"dl_{q['id']}")
+            if c3.button("Delete", key=f"del_{q['id']}"):
+                (INQUIRIES / f"{q['id']}.json").unlink(missing_ok=True)
+                st.rerun()
+
+
+def preferences_ui() -> None:
+    p = load_prefs()
+    st.write("Defaults for this computer. They are saved in `preferences.json` next to the app.")
+    with st.form("prefs"):
+        a, b = st.columns(2)
+        speed = a.selectbox("Default speed mode", list(SPEED_MODES), index=list(SPEED_MODES).index(
+            p.get("speed", "fast")) if p.get("speed", "fast") in SPEED_MODES else 1,
+            format_func=lambda k: SPEED_MODES[k]["label"])
+        devices = ["auto", "cpu", "intel:gpu", "intel:npu", "cuda:0", "mps"]
+        device = b.selectbox("Default device", devices, index=devices.index(p.get("device", "auto"))
+                             if p.get("device", "auto") in devices else 0,
+                             format_func=lambda d: "auto (fastest found)" if d == "auto" else device_label(d))
+        tips = a.toggle("Show beginner tips on Detect", p.get("tips", True))
+        email = b.text_input("Team email for inquiries", p.get("contact_email", ""),
+                             help="Messages saved on Contact the team get an 'Email it' button addressed here.")
+        if st.form_submit_button("Save preferences", type="primary"):
+            if email and "@" not in email:
+                st.error("That email address does not look right.")
+            else:
+                save_prefs({"speed": speed, "device": device, "tips": tips, "contact_email": email.strip()})
+                st.success("Saved. They apply the next time you open Detect.")
+
+
 {"Detect": page_detect, "Calibrate": page_calibrate, "Results": page_results, "Event Review": page_review,
- "Report": page_report, "Proposed designs": page_design, "Method": page_method}[page]()
+ "Report": page_report, "Proposed designs": page_design, "Method": page_method, "Help & contact": page_help}[page]()
+st.markdown("<div class='nm-footer'>NearMiss · a screening tool for traffic conflicts, not a crash predictor or a "
+            "safety certification · everything runs on this computer</div>", unsafe_allow_html=True)

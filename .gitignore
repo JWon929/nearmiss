@@ -12,3 +12,5 @@ runs/
 _orig_phase1/
 nearmiss/
 openvino_cache/
+inquiries/
+preferences.json
