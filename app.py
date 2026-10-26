@@ -32,6 +32,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+import figures
+
 from detect_job import load_job, new_job, run_job
 from detector_tracker import (MODEL_CHOICES, VISDRONE_MODEL, RenderOptions, RoadUserTracker, TrackerSettings,
                               aerial_choices, auto_stride, device_label, finds_people, intel_devices, pick_device,
@@ -59,11 +61,16 @@ TRASH = RUNS / ".trash"
 CSV_HEADER = ["frame", "time_s", "track_id", "class_name", "confidence", "x1", "y1", "x2", "y2", "center_x", "center_y"]
 DISPLAY_W = 900
 STEPS = ["Detect", "Calibrate", "Results", "Event Review", "Report"]
-PAGES = STEPS + ["Proposed designs", "Method", "Help & contact"]
+LEARN = ["Purpose", "Method", "Proposed designs", "Help & contact"]
+PAGES = STEPS + LEARN
 PAGE_ICONS = {"Detect": ":material/videocam:", "Calibrate": ":material/straighten:", "Results": ":material/analytics:",
               "Event Review": ":material/fact_check:", "Report": ":material/description:",
-              "Proposed designs": ":material/architecture:", "Method": ":material/menu_book:",
-              "Help & contact": ":material/support_agent:"}
+              "Purpose": ":material/flag:", "Proposed designs": ":material/architecture:",
+              "Method": ":material/menu_book:", "Help & contact": ":material/support_agent:"}
+# One accent colour per page: its banner, its sidebar button and its buttons use it, so each step is easy to tell apart.
+PAGE_COLORS = {"Detect": "#2563eb", "Calibrate": "#7c3aed", "Results": "#0d9488", "Event Review": "#ea580c",
+               "Report": "#16a34a", "Purpose": "#db2777", "Method": "#4f46e5", "Proposed designs": "#0891b2",
+               "Help & contact": "#64748b"}
 INQUIRIES = Path(__file__).parent / "inquiries"          # questions and feedback typed into the app (git-ignored)
 PREFS_FILE = Path(__file__).parent / "preferences.json"   # this computer's defaults (git-ignored)
 LABEL_TEXT = {"tp": "Real near miss", "fp": "False alarm", "unsure": "Unsure"}
@@ -115,6 +122,25 @@ button[kind="primary"], button[kind="secondary"] {border-radius: 10px !important
 button[kind="primary"] {box-shadow: 0 3px 10px rgba(31,95,191,.25);}
 div[data-baseweb="tab-list"] {gap: 2px;}
 button[data-baseweb="tab"] {border-radius: 10px 10px 0 0; padding: 6px 12px;}
+.nm-navhead {font-size: .72rem; font-weight: 750; letter-spacing: .1em; text-transform: uppercase; opacity: .6;
+  margin: 12px 0 4px 2px;}
+section[data-testid="stSidebar"] div[class*="st-key-nav_"] {margin-bottom: -8px;}
+section[data-testid="stSidebar"] div[class*="st-key-nav_"] button {box-shadow: none !important; min-height: 2.1rem;}
+section[data-testid="stSidebar"] div[class*="st-key-nav_"] button p {font-weight: 600;}
+.nm-pager-gap {height: 18px;}
+.st-key-pager {background: rgba(128,128,128,.04);}
+/* ---- method and purpose pages ---- */
+.nm-card {border-radius: 14px; padding: 14px 16px; height: 100%; border: 1px solid rgba(128,128,128,.2);}
+.nm-card h4 {margin: 0 0 4px 0; font-size: 1.02rem;}
+.nm-card p {margin: 0; font-size: .92rem; opacity: .9;}
+.nm-fig {border-radius: 14px; border: 1px solid rgba(128,128,128,.18); padding: 10px; background: rgba(255,255,255,.55);
+  text-align: center; margin: 4px 0 6px 0;}
+.nm-fig img {max-width: 100%; height: auto;}
+.nm-fig figcaption {font-size: .8rem; opacity: .75; margin-top: 4px;}
+.nm-section {display: flex; align-items: center; gap: 10px; margin: 22px 0 8px 0;}
+.nm-section .dot {width: 30px; height: 30px; border-radius: 9px; display: flex; align-items: center; justify-content: center;
+  color: #fff; font-family: "Material Symbols Rounded"; font-size: 19px;}
+.nm-section h3 {margin: 0; padding: 0; font-size: 1.25rem;}
 .nm-footer {margin-top: 28px; padding-top: 10px; border-top: 1px solid rgba(128,128,128,.2); font-size: .78rem;
   opacity: .65;}
 .nm-faq-q {font-weight: 600;}
@@ -145,20 +171,53 @@ section[data-testid="stSidebar"] div[role="radiogroup"] label {padding: 2px 0;}
 
 
 # ------------------------------------------------------------------ small UI pieces
+def hex_rgb(c: str) -> str:
+    return ",".join(str(int(c[i:i + 2], 16)) for i in (1, 3, 5))
+
+
 def page_header(page: str, title: str, intro: str = "") -> None:
-    """The banner at the top of every page: icon, step number, title, a one-line explanation and step progress."""
+    """The banner at the top of every page, in the page's own colour: icon, step number or section, title, a one-line
+    explanation and, on the procedure steps, which steps are done. Also tints this page's buttons and tabs."""
     icon = PAGE_ICONS.get(page, ":material/info:").split("/")[-1].strip(":")
-    pill = f"<div class='pill'>Step {STEPS.index(page) + 1} of {len(STEPS)}</div>" if page in STEPS else \
-        "<div class='pill'>Guide</div>"
+    c = PAGE_COLORS.get(page, "#2563eb")
+    rgb_ = hex_rgb(c)
+    pill = f"Procedure · step {STEPS.index(page) + 1} of {len(STEPS)}" if page in STEPS else "Learn & help"
     bars = ""
     if page in STEPS:
         done = steps_done(st.session_state.get("rid")) if st.session_state.get("rid") else {}
         bars = "<div class='nm-steps'>" + "".join(
-            f"<span class='{'on' if p == page else ('done' if done.get(p) else '')}' title='{p}'></span>"
-            for p in STEPS) + "</div>"
+            f"<span style='background:{PAGE_COLORS[p] if (p == page or done.get(p)) else 'rgba(128,128,128,.22)'};"
+            f"opacity:{1 if p == page else (.55 if done.get(p) else 1)}' title='{p}'></span>" for p in STEPS) + "</div>"
     intro_html = f"<div class='intro'>{intro}</div>" if intro else ""
-    st.markdown(f"<div class='nm-hero'><div class='row'><div class='icon'>{icon}</div><div>{pill}<h1>{html_escape(title)}"
-                f"</h1></div></div>{intro_html}{bars}</div>", unsafe_allow_html=True)
+    st.markdown(f"""<style>
+section.main button[kind="primary"], div[data-testid="stMain"] button[kind="primary"] {{
+  background: {c} !important; border-color: {c} !important; box-shadow: 0 3px 10px rgba({rgb_},.3) !important;}}
+div[data-testid="stMain"] button[data-baseweb="tab"][aria-selected="true"] p {{color: {c} !important;}}
+div[data-testid="stMain"] div[data-baseweb="tab-highlight"] {{background-color: {c} !important;}}
+</style>
+<div class='nm-hero' style='background: linear-gradient(120deg, rgba({rgb_},.20) 0%, rgba({rgb_},.07) 50%,
+  rgba({rgb_},.14) 100%); border-color: rgba({rgb_},.28)'>
+<div class='row'><div class='icon' style='background:{c}; box-shadow: 0 4px 14px rgba({rgb_},.4)'>{icon}</div>
+<div><div class='pill' style='color:{c}; background: rgba({rgb_},.13)'>{pill}</div><h1>{html_escape(title)}</h1></div>
+</div>{intro_html}{bars}</div>""", unsafe_allow_html=True)
+
+
+def step_pager(page: str) -> None:
+    """Back / Next between the procedure steps, at the bottom of each step."""
+    if page not in STEPS:
+        return
+    i = STEPS.index(page)
+    st.markdown("<div class='nm-pager-gap'></div>", unsafe_allow_html=True)
+    with st.container(border=True, key="pager"):
+        a, mid, b = st.columns([2, 3, 2], vertical_alignment="center")
+        if i > 0:
+            a.button(f"Back: {STEPS[i - 1]}", icon=":material/arrow_back:", on_click=go, args=(STEPS[i - 1],),
+                     width="stretch", key="pager_back")
+        mid.markdown(f"<div style='text-align:center;opacity:.75;font-size:.85rem'>Step {i + 1} of {len(STEPS)}: "
+                     f"<b style='color:{PAGE_COLORS[page]}'>{page}</b></div>", unsafe_allow_html=True)
+        if i < len(STEPS) - 1:
+            b.button(f"Next: {STEPS[i + 1]}", icon=":material/arrow_forward:", on_click=go,
+                     args=(STEPS[i + 1],), type="primary", width="stretch", key="pager_next")
 
 
 def badge(severity: str, provisional: bool = False) -> str:
@@ -552,14 +611,25 @@ with st.sidebar:
             st.session_state["rid"] = ids[0]
         st.session_state["rec_pick"] = st.session_state["rid"]
         st.selectbox("Recording", ids, key="rec_pick", format_func=lambda i: dict(runs)[i], on_change=pick_recording)
-    # Option labels never change between runs (a changed label resets the radio to the first page); ticks go below.
-    page = st.radio("Pages", PAGES, key="page",
-                    format_func=lambda p: f"{PAGE_ICONS[p]} " + (f"{STEPS.index(p) + 1}. {p}" if p in STEPS else p))
+    if st.session_state.get("page") not in PAGES:
+        st.session_state["page"] = "Detect" if all_runs else "Purpose"
+    page = st.session_state["page"]
+    done = steps_done(st.session_state["rid"]) if st.session_state.get("rid") else {}
+    nav_css = "".join(
+        f".st-key-nav_{i} button {{border-left: 4px solid {PAGE_COLORS[p]} !important; justify-content: flex-start;}}"
+        f".st-key-nav_{i} button[kind='primary'] {{background: {PAGE_COLORS[p]} !important; border-color: "
+        f"{PAGE_COLORS[p]} !important; color: #fff !important;}}" for i, p in enumerate(PAGES))
+    st.markdown(f"<style>{nav_css}</style><div class='nm-navhead'>Procedure</div>", unsafe_allow_html=True)
+    for i, p in enumerate(STEPS):
+        st.button(f"{i + 1}. {p}" + ("  ✓" if done.get(p) else ""), key=f"nav_{i}", icon=PAGE_ICONS[p],
+                  type="primary" if p == page else "secondary", on_click=go, args=(p,), width="stretch")
     if st.session_state.get("rid"):
-        done = steps_done(st.session_state["rid"])
         n_done = sum(bool(done.get(p)) for p in STEPS)
-        st.progress(n_done / len(STEPS), text=f"{n_done} of {len(STEPS)} steps done"
-                    + (": " + ", ".join(p for p in STEPS if done.get(p)) if n_done else ""))
+        st.progress(n_done / len(STEPS), text=f"{n_done} of {len(STEPS)} steps done for this recording")
+    st.markdown("<div class='nm-navhead'>Learn & help</div>", unsafe_allow_html=True)
+    for i, p in enumerate(LEARN, start=len(STEPS)):
+        st.button(p, key=f"nav_{i}", icon=PAGE_ICONS[p], type="primary" if p == page else "secondary", on_click=go,
+                  args=(p,), width="stretch")
     st.divider()
     if demo.demo_available() and st.button("Load synthetic demo"):
         st.session_state["rid"] = create_demo_run()
@@ -570,8 +640,6 @@ with st.sidebar:
     if st.session_state.get("_cleaned"):
         st.caption(f"Removed {st.session_state['_cleaned']} unfinished run folder(s) left by a stopped detection.")
     st.caption(":material/lock: All processing happens on this computer. Footage is not uploaded anywhere.")
-    st.button("Help, questions & feedback", icon=":material/support_agent:", on_click=go, args=("Help & contact",),
-              width="stretch", key="sb_help")
 
 rid, meta = current()
 
@@ -2774,8 +2842,178 @@ each other, never with counts from video.""")
 
 
 # ================================================================== METHOD
+def section(title: str, icon: str, color: str) -> None:
+    """A coloured section heading with an icon, used on the Method and Purpose pages."""
+    st.markdown(f"<div class='nm-section'><div class='dot' style='background:{color}'>{icon}</div><h3>{title}</h3>"
+                "</div>", unsafe_allow_html=True)
+
+
+def card(title: str, text: str, color: str) -> str:
+    rgb_ = hex_rgb(color)
+    return (f"<div class='nm-card' style='background: rgba({rgb_},.08); border-color: rgba({rgb_},.3)'>"
+            f"<h4 style='color:{color}'>{title}</h4><p>{text}</p></div>")
+
+
+def page_purpose():
+    page_header("Purpose", "Why NearMiss exists",
+                "Crashes are what we want to prevent, but they are too rare at one intersection to learn from quickly. "
+                "Close calls are not.")
+    a, b, c = st.columns(3)
+    a.markdown(card("The problem", "At any single intersection serious crashes are rare, so crash records take years "
+                    "to show a pattern, and by then people have been hurt.", PAGE_COLORS["Purpose"]),
+               unsafe_allow_html=True)
+    b.markdown(card("The idea", "Near misses happen far more often than crashes. Counting them, a traffic-conflict "
+                    "study, shows where danger is building up within days of filming.", PAGE_COLORS["Method"]),
+               unsafe_allow_html=True)
+    c.markdown(card("What NearMiss does", "It watches ordinary video of an intersection, measures how close road users "
+                    "came and how little time they had, and lists every close call for a person to check.",
+                    PAGE_COLORS["Results"]), unsafe_allow_html=True)
+
+    section("Who it is for", "groups", PAGE_COLORS["Detect"])
+    a, b, c = st.columns(3)
+    a.markdown(card("Residents and students", "Turn a phone or drone video of a crossing you worry about into evidence: "
+                    "how often, where, and between whom.", PAGE_COLORS["Detect"]), unsafe_allow_html=True)
+    b.markdown(card("Schools and community groups", "Show a school board or council a clear, checked report instead of "
+                    "anecdotes.", PAGE_COLORS["Calibrate"]), unsafe_allow_html=True)
+    c.markdown(card("Planners and engineers", "Screen many hours of footage quickly and compare before and after a "
+                    "change, or alternative designs.", PAGE_COLORS["Proposed designs"]), unsafe_allow_html=True)
+
+    section("What you get", "inventory_2", PAGE_COLORS["Results"])
+    a, b, c, d = st.columns(4)
+    for col, (t, x, k) in zip((a, b, c, d), [
+            ("A map of close calls", "Where they happened, with a heat layer and named zones.", "Results"),
+            ("Fair rates", "Per 100 vehicles and per hour, so busy and quiet clips compare fairly.", "Results"),
+            ("Your own check", "Every flag reviewed by a person: real, false alarm or unsure.", "Event Review"),
+            ("A shareable report", "Precision, limits and blurred pictures, ready to print.", "Report")]):
+        col.markdown(card(t, x, PAGE_COLORS[k]), unsafe_allow_html=True)
+
+    section("What it is not", "block", "#b91c1c")
+    st.markdown(card("A screening tool, not a verdict", "NearMiss does not predict crashes, assign blame or certify an "
+                     "intersection as safe. A flag is a measurement that needs a human look; zero flags with a "
+                     "vehicles-only drone model means pedestrians were not measured, not that they are safe.",
+                     "#b91c1c"), unsafe_allow_html=True)
+
+    section("How it works, in five steps", "route", PAGE_COLORS["Method"])
+    st.markdown(figures.figure(figures.pipeline()), unsafe_allow_html=True)
+    cols = st.columns(len(STEPS))
+    for i, (col, p) in enumerate(zip(cols, STEPS)):
+        with col:
+            st.markdown(card(f"{i + 1}. {p}", {"Detect": "Find and follow every road user in the video.",
+                                               "Calibrate": "Click a shape of known size to turn pixels into metres.",
+                                               "Results": "See the close calls, rates, zones and speeds.",
+                                               "Event Review": "Decide which flags were real near misses.",
+                                               "Report": "Check the numbers and share a report."}[p], PAGE_COLORS[p]),
+                        unsafe_allow_html=True)
+    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+    a, b, _ = st.columns([1, 1, 2])
+    a.button("Start: 1. Detect", type="primary", icon=":material/arrow_forward:", on_click=go, args=("Detect",),
+             width="stretch")
+    if demo.demo_available():
+        b.button("Try the demo first", icon=":material/science:", width="stretch",
+                 on_click=lambda: st.session_state.update(rid=create_demo_run(), page="Results"))
+    st.caption(":material/lock: Footage never leaves this computer. Faces and plates are pixelated in every video the "
+               "app makes.")
+
+
 def page_method():
-    st.title("Method and limits")
+    page_header("Method", "How NearMiss works",
+                "From video to a reviewed list of close calls, step by step, and what the numbers can and cannot tell "
+                "you.")
+    st.markdown(figures.figure(figures.pipeline()), unsafe_allow_html=True)
+    tabs = st.tabs([":material/videocam: Detection", ":material/straighten: Calibration",
+                    ":material/insights: Indicators", ":material/filter_alt: Filters & severity",
+                    ":material/verified: Validation", ":material/shield: Privacy & limits", ":material/notes: Full text"])
+    with tabs[0]:
+        section("Finding and following road users", "videocam", PAGE_COLORS["Detect"])
+        a, b = st.columns(2)
+        a.markdown(card("Street-level cameras", "A pretrained YOLOv8 model (COCO classes) finds people, bicycles, "
+                        "motorcycles, cars, buses and trucks in every analysed frame.", PAGE_COLORS["Detect"]),
+                   unsafe_allow_html=True)
+        b.markdown(card("Drone footage", "An aerial model (YOLO11-OBB, DOTA) finds vehicles from above, with no "
+                        "pedestrian class; the optional VisDrone model also finds pedestrians and bikes.",
+                        PAGE_COLORS["Method"]), unsafe_allow_html=True)
+        a, b = st.columns(2)
+        a.markdown(card("Tracking", "ByteTrack links the boxes of one road user from frame to frame. A box that is "
+                        "missed for a moment is carried forward, so tracks do not flicker.", PAGE_COLORS["Results"]),
+                   unsafe_allow_html=True)
+        b.markdown(card("Moving camera", "If the camera drifts or zooms, every frame is lined up with the first one "
+                        "(ORB features and a RANSAC homography), so parked cars stay parked.",
+                        PAGE_COLORS["Event Review"]), unsafe_allow_html=True)
+    with tabs[1]:
+        section("Turning pixels into metres", "straighten", PAGE_COLORS["Calibrate"])
+        l, r = st.columns([3, 2])
+        l.markdown(figures.figure(figures.calibration(), "Four clicks on a rectangle of known size give the mapping "
+                                  "from the camera view to the road seen from above."), unsafe_allow_html=True)
+        r.markdown(card("Why it matters", "Every distance, speed and time to collision comes from this mapping. A 10% "
+                        "error in the scale is a 10% error in every speed.", PAGE_COLORS["Calibrate"]),
+                   unsafe_allow_html=True)
+        r.markdown("<div style='height:8px'></div>" + card(
+            "Checking it", "Measure one or more other known distances. Until that check is done, or when it is more than "
+            "10% off, or cars measure an implausible length, every severity is shown as provisional.",
+            PAGE_COLORS["Report"]), unsafe_allow_html=True)
+    with tabs[2]:
+        section("Measuring how close a call was", "insights", PAGE_COLORS["Results"])
+        a, b = st.columns(2)
+        a.markdown(figures.figure(figures.ttc(), "<b>Time to collision (TTC)</b>: seconds until two road users would "
+                                  "reach a collision distance if both kept their speed and direction."),
+                   unsafe_allow_html=True)
+        b.markdown(figures.figure(figures.closest(), "<b>Closest approach</b>: the smallest distance over the whole "
+                                  "encounter. The event picture, the number and the chart all use that moment."),
+                   unsafe_allow_html=True)
+        a, b = st.columns(2)
+        a.markdown(figures.figure(figures.pet(), "<b>Post-encroachment time (PET, FHWA)</b>: from the first road user "
+                                  "clearing a crossing point to the second reaching it. Optional flag."),
+                   unsafe_allow_html=True)
+        b.markdown(figures.figure(figures.drac(), "<b>DRAC</b>: the braking either road user would have needed to "
+                                  "avoid the collision. Always shown; optional flag."), unsafe_allow_html=True)
+    with tabs[3]:
+        section("Cutting false alarms, rating what is left", "filter_alt", PAGE_COLORS["Event Review"])
+        c = st.columns(3)
+        c[0].markdown(card("Detected twice", "Two tracks closer than half their widths are one road user seen twice, "
+                           "not a collision.", PAGE_COLORS["Event Review"]), unsafe_allow_html=True)
+        c[1].markdown(card("Too brief", "A time-to-collision flag must last at least 0.5 s; one noisy heading is not a "
+                           "conflict.", PAGE_COLORS["Event Review"]), unsafe_allow_html=True)
+        c[2].markdown(card("Passing a stopped car", "Driving past a parked car is only a conflict if the driver braked "
+                           "hard or they really came close.", PAGE_COLORS["Event Review"]), unsafe_allow_html=True)
+        st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+        c = st.columns(3)
+        for col, (sev, text) in zip(c, [("candidate", "Worth a look."), ("moderate", "Closer, or less time to react."),
+                                        ("serious", "Very close, or almost no time to react.")]):
+            col.markdown(card(sev.capitalize(), text + " Set by the thresholds on Results; screening labels, not "
+                              "verdicts.", SEV_HEX[sev]), unsafe_allow_html=True)
+        st.caption("Two flagged pairs are merged only when they share a road user (an ID switch). Rates per hour use "
+                   "the whole observation period; *flagged* is what the app found, *confirmed* what a reviewer labelled "
+                   "real.")
+    with tabs[4]:
+        section("Checking the app against people", "verified", PAGE_COLORS["Report"])
+        a, b = st.columns(2)
+        a.markdown(card("Precision", "Of the flags you reviewed, the share that were real near misses. Labels belong to "
+                        "exactly one event, matched by its two road users, then by time.", PAGE_COLORS["Report"]),
+                   unsafe_allow_html=True)
+        b.markdown(card("Recall (at most)", "Real near misses found divided by real ones found plus the ones you noticed "
+                        "were missed. Only an upper bound: unnoticed misses cannot be counted.", PAGE_COLORS["Report"]),
+                   unsafe_allow_html=True)
+        st.markdown("<div style='height:10px'></div>" + card(
+            "Proposed designs", "For an intersection that is not built yet, simulated trajectories of each alternative go "
+            "through the same conflict check (the FHWA SSAM approach). Compare alternatives with each other, never with "
+            "video counts.", PAGE_COLORS["Proposed designs"]), unsafe_allow_html=True)
+    with tabs[5]:
+        section("Privacy and limits", "shield", PAGE_COLORS["Purpose"])
+        l, r = st.columns([3, 2])
+        l.markdown(figures.figure(figures.privacy(), "What is pixelated in the videos the app makes."),
+                   unsafe_allow_html=True)
+        r.markdown(card("Privacy", "Everything runs on this computer. Anything the detector misses is not blurred, so "
+                        "check videos before sharing them; the original video can be deleted on Report.",
+                        PAGE_COLORS["Purpose"]), unsafe_allow_html=True)
+        r.markdown("<div style='height:8px'></div>" + card(
+            "Limits", "One camera, a flat road, no night or heavy-rain testing. Models miss far or small road users. "
+            "Every flag needs a human look. NearMiss does <b>not</b> predict crashes or certify an intersection as "
+            "safe.", "#b91c1c"), unsafe_allow_html=True)
+    with tabs[6]:
+        method_full_text()
+
+
+def method_full_text():
     st.markdown("""
 **Pipeline.** For street-level cameras a pretrained YOLOv8 model (COCO) finds people, bicycles, motorcycles, cars,
 buses and trucks. For drone footage the default is a pretrained aerial model (YOLO11-OBB, trained on the DOTA aerial
@@ -3050,6 +3288,8 @@ def preferences_ui() -> None:
 
 
 {"Detect": page_detect, "Calibrate": page_calibrate, "Results": page_results, "Event Review": page_review,
- "Report": page_report, "Proposed designs": page_design, "Method": page_method, "Help & contact": page_help}[page]()
+ "Report": page_report, "Proposed designs": page_design, "Method": page_method, "Help & contact": page_help,
+ "Purpose": page_purpose}[page]()
+step_pager(page)
 st.markdown("<div class='nm-footer'>NearMiss · a screening tool for traffic conflicts, not a crash predictor or a "
             "safety certification · everything runs on this computer</div>", unsafe_allow_html=True)
