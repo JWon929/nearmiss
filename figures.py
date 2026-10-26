@@ -169,5 +169,29 @@ def privacy() -> str:
     return _img(s, "Privacy blur")
 
 
+def hero_intersection() -> str:
+    """Decorative intersection for the Home banner: two roads, a crosswalk, a car, a pedestrian and a near-miss ring."""
+    stripes = "".join(f"<rect x='{150 + i * 14}' y='86' width='8' height='26' rx='2' fill='#fff' opacity='.9'/>"
+                      for i in range(6))
+    s = (f"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 340 220'>"
+         f"<rect x='0' y='0' width='340' height='220' rx='22' fill='#0f766e' opacity='.10'/>"
+         f"<rect x='0' y='80' width='340' height='70' fill='#475569' opacity='.85'/>"
+         f"<rect x='135' y='0' width='70' height='220' fill='#475569' opacity='.85'/>"
+         f"<line x1='0' y1='115' x2='130' y2='115' stroke='#facc15' stroke-width='3' stroke-dasharray='12 10'/>"
+         f"<line x1='210' y1='115' x2='340' y2='115' stroke='#facc15' stroke-width='3' stroke-dasharray='12 10'/>"
+         f"{stripes}"
+         f"<circle cx='190' cy='100' r='34' fill='{ORANGE}' opacity='.18' stroke='{ORANGE}' stroke-width='3'/>"
+         f"<rect x='205' y='122' width='52' height='26' rx='7' fill='{BLUE}'/>"
+         f"<rect x='231' y='126' width='14' height='18' rx='3' fill='#bfdbfe'/>"
+         f"<line x1='208' y1='135' x2='170' y2='135' stroke='{BLUE}' stroke-width='3' stroke-dasharray='5 5' "
+         f"opacity='.7'/>"
+         f"<circle cx='183' cy='86' r='8' fill='{PINK}'/>"
+         f"<rect x='178' y='94' width='10' height='18' rx='4' fill='{PINK}'/>"
+         f"<text x='190' y='52' text-anchor='middle' font-size='15' font-weight='700' fill='{ORANGE}' {FONT}>"
+         f"1.4 m · 0.8 s</text>"
+         f"</svg>")
+    return _img(s, "An intersection with a near miss between a car and a pedestrian")
+
+
 def figure(img_tag: str, caption: str = "") -> str:
     return f"<figure class='nm-fig'>{img_tag}" + (f"<figcaption>{caption}</figcaption>" if caption else "") + "</figure>"

@@ -37,7 +37,7 @@ import figures
 from detect_job import load_job, new_job, run_job
 from detector_tracker import (MODEL_CHOICES, VISDRONE_MODEL, RenderOptions, RoadUserTracker, TrackerSettings,
                               aerial_choices, auto_stride, device_label, finds_people, intel_devices, pick_device,
-                              render_from_detections)
+                              render_frame, render_from_detections)
 from engine import demo, design, review_pack, validation
 from engine.analysis import (analyze, build_report_html, cut_clip, distance_series, event_frame, events_table,
                              load_tracker_csv, topdown_map)
@@ -129,6 +129,26 @@ section[data-testid="stSidebar"] div[class*="st-key-nav_"] button {box-shadow: n
 section[data-testid="stSidebar"] div[class*="st-key-nav_"] button p {font-weight: 600;}
 .nm-pager-gap {height: 18px;}
 /* ---- home ---- */
+.nm-homehero {display: flex; align-items: center; gap: 24px; border-radius: 22px; padding: 28px 30px; margin-bottom: 18px;
+  background: linear-gradient(125deg, rgba(15,118,110,.22) 0%, rgba(37,99,235,.14) 55%, rgba(219,39,119,.12) 100%);
+  border: 1px solid rgba(15,118,110,.28); box-shadow: 0 8px 28px rgba(15,23,42,.08); position: relative; overflow: hidden;}
+.nm-homehero .left {flex: 1 1 auto; min-width: 0;}
+.nm-homehero .brandrow {display: flex; align-items: center; gap: 18px;}
+.nm-homehero .biglogo {flex: 0 0 auto; width: 92px; height: 92px; border-radius: 24px; color: #fff; font-size: 60px;
+  display: flex; align-items: center; justify-content: center; font-family: "Material Symbols Rounded";
+  background: linear-gradient(135deg, #2563eb, #0f766e); box-shadow: 0 10px 26px rgba(37,99,235,.38);}
+.nm-homehero .kicker {font-size: .85rem; font-weight: 700; letter-spacing: .12em; text-transform: uppercase;
+  color: #0f766e;}
+.nm-homehero .big {font-size: 3.1rem; font-weight: 800; letter-spacing: -.02em; line-height: 1.05;}
+.nm-homehero .lead {font-size: 1.12rem; opacity: .85; margin-top: 14px; max-width: 640px; line-height: 1.5;}
+.nm-homehero .promises {display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px;}
+.nm-homehero .promises span {display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px; border-radius: 999px;
+  font-size: .85rem; font-weight: 600; background: rgba(255,255,255,.6); border: 1px solid rgba(15,118,110,.25);}
+.nm-homehero .promises i {font-style: normal; font-family: "Material Symbols Rounded"; font-size: 18px; color: #0f766e;}
+.nm-homehero .art {flex: 0 0 300px;}
+.nm-homehero .art img {width: 100%; height: auto; display: block;}
+@media (max-width: 1000px) {.nm-homehero .art {display: none;} .nm-homehero .big {font-size: 2.4rem;}}
+@media (prefers-color-scheme: dark) {.nm-homehero .promises span {background: rgba(255,255,255,.08);}}
 .nm-act {min-height: 92px; line-height: 1.35;}
 .nm-act .i {float: left; width: 40px; height: 40px; border-radius: 11px; margin: 2px 12px 6px 0; color: #fff;
   display: flex; align-items: center; justify-content: center; font-family: "Material Symbols Rounded"; font-size: 23px;}
@@ -142,6 +162,12 @@ section[data-testid="stSidebar"] div[class*="st-key-nav_"] button p {font-weight
 .nm-card {border-radius: 14px; padding: 14px 16px; height: 100%; border: 1px solid rgba(128,128,128,.2);}
 .nm-card h4 {margin: 0 0 4px 0; font-size: 1.02rem;}
 .nm-card p {margin: 0; font-size: .92rem; opacity: .9;}
+div[data-testid="stVerticalBlockBorderWrapper"] {background: rgba(255,255,255,.55);}
+@media (prefers-color-scheme: dark) {
+  div[data-testid="stVerticalBlockBorderWrapper"], .nm-fig {background: rgba(255,255,255,.04) !important;}
+}
+section[data-testid="stSidebar"] {border-right: 1px solid rgba(128,128,128,.18);}
+div[data-testid="stImage"] img, div[data-testid="stVideo"] video {border-radius: 12px;}
 .nm-fig {border-radius: 14px; border: 1px solid rgba(128,128,128,.18); padding: 10px; background: rgba(255,255,255,.55);
   text-align: center; margin: 4px 0 6px 0;}
 .nm-fig img {max-width: 100%; height: auto;}
@@ -210,6 +236,39 @@ div[data-testid="stMain"] div[data-baseweb="tab-highlight"] {{background-color: 
 <div class='row'><div class='icon' style='background:{c}; box-shadow: 0 4px 14px rgba({rgb_},.4)'>{icon}</div>
 <div><div class='pill' style='color:{c}; background: rgba({rgb_},.13)'>{pill}</div><h1>{html_escape(title)}</h1></div>
 </div>{intro_html}{bars}</div>""", unsafe_allow_html=True)
+
+
+SCROLL_JS = """<script>
+const d = window.parent.document;
+function toTop() {
+  for (const el of [d.querySelector('[data-testid="stMain"]'), d.querySelector('[data-testid="stAppViewContainer"]'),
+                    d.querySelector('section.main'), d.scrollingElement]) {
+    if (el && el.scrollTop > 0) el.scrollTo({top: 0, behavior: 'instant'});
+  }
+}
+if (%s) { toTop(); setTimeout(toTop, 80); setTimeout(toTop, 400); }
+if (!d.nearmissTabScroll) {      // clicking a tab further down the page brings the tab row to the top
+  d.nearmissTabScroll = true;
+  d.addEventListener('click', (e) => {
+    const tab = e.target.closest('button[data-baseweb="tab"]');
+    if (!tab) return;
+    const bar = tab.closest('[data-baseweb="tab-list"]');
+    if (bar && bar.getBoundingClientRect().top < 0) bar.scrollIntoView({block: 'start', behavior: 'smooth'});
+  }, true);
+}
+</script>"""
+
+
+def scroll_helper(new_page: bool, page: str) -> None:
+    """Start each page at the top (Streamlit keeps the old scroll position), and keep tab switches in view.
+    The page name is in the script so that every page change gives a new script, which the browser then runs."""
+    html = SCROLL_JS % ("true" if new_page else "false") + f"<!-- {html_escape(page)} -->"
+    if hasattr(st, "iframe"):
+        st.iframe(html, height=1)
+    else:
+        import streamlit.components.v1 as components
+
+        components.html(html, height=0)
 
 
 def step_pager(page: str) -> None:
@@ -655,6 +714,8 @@ with st.sidebar:
     if st.session_state.get("_cleaned"):
         st.caption(f"Removed {st.session_state['_cleaned']} unfinished run folder(s) left by a stopped detection.")
     st.caption(":material/lock: All processing happens on this computer. Footage is not uploaded anywhere.")
+    scroll_helper(st.session_state.get("_shown_page") != page, page)
+    st.session_state["_shown_page"] = page
 
 rid, meta = current()
 
@@ -2894,10 +2955,28 @@ def step_dots(prog: dict) -> str:
         for p in STEPS) + "</div>"
 
 
+def home_banner() -> None:
+    """The big welcome banner: large logo, name, what it does, three promises, and an intersection illustration."""
+    c = PAGE_COLORS["Home"]
+    chips_html = "".join(f"<span><i>{i}</i>{t}</span>" for i, t in (
+        ("lock", "Runs on this computer"), ("blur_on", "Faces and plates blurred"),
+        ("fact_check", "Every flag checked by you")))
+    st.markdown(f"""<div class='nm-homehero'>
+<div class='left'>
+  <div class='brandrow'><div class='biglogo'>traffic</div>
+    <div><div class='kicker'>Welcome to</div><div class='big'>NearMiss</div></div></div>
+  <div class='lead'>Film an intersection, and NearMiss finds every moment two road users came dangerously close, for
+  you to check and report.</div>
+  <div class='promises'>{chips_html}</div>
+</div>
+<div class='art'>{figures.hero_intersection()}</div>
+</div>""", unsafe_allow_html=True)
+    st.markdown(f"<style>div[data-testid='stMain'] button[kind='primary'] {{background: {c} !important; "
+                f"border-color: {c} !important;}}</style>", unsafe_allow_html=True)
+
+
 def page_home():
-    page_header("Home", "Welcome to NearMiss",
-                "Film an intersection, and NearMiss finds every moment two road users came dangerously close, for you "
-                "to check and report. Everything runs on this computer.")
+    home_banner()
     runs = list_runs()
     metas = {r: read_json(run_dir(r) / "meta.json", {}) or {} for r, _ in runs}
     last = st.session_state.get("rid") if st.session_state.get("rid") in metas else (runs[0][0] if runs else None)
@@ -3043,11 +3122,101 @@ def page_purpose():
                "app makes.")
 
 
+@st.cache_resource(show_spinner="Preparing the pictures from the sample clip...")
+def method_images() -> Optional[dict]:
+    """Real pictures for the Method page, made with the app's own code on the bundled sample clip (scripted road
+    users on a drawn intersection): detection boxes, the calibration shape, its bird's-eye view, a flagged near miss and
+    the top-down map, plus a short clip with boxes. Made once per app start; None if the sample clip is missing."""
+    if not demo.demo_available():
+        return None
+    from detector_tracker import DrawItem
+    from engine.analysis import boxes_near
+    from engine.conflicts import detect_conflicts as _dc
+    from engine.trajectories import Detections as _Det, build_tracks as _bt
+
+    t = demo.truth()
+    cal = Calibration.from_points(t["calibration_points_px"], t["calibration_width_m"], t["calibration_length_m"],
+                                  tuple(t["size"]))
+    det = _Det(demo.scripted_detections())
+    S = Settings()
+    tracks, _ = _bt(det, cal, S)
+    events = _dc(tracks, S)
+    ev = events[0] if events else None
+    t_show = ev["t_peak"] - 1.0 if ev else 11.0
+    W, H = (int(v) for v in t["size"])
+
+    # The sample's road users are small in a big frame: show the part of the picture where things happen
+    near = [b for _, _, b in boxes_near(det, t_show, max_dt=3.0)] + [np.r_[np.min(t["calibration_points_px"], 0),
+                                                                          np.max(t["calibration_points_px"], 0)]]
+    x0, y0 = np.min([b[:2] for b in near], 0) - 90
+    x1, y1 = np.max([b[2:] for b in near], 0) + 90
+    w = max(x1 - x0, (y1 - y0) * 16 / 9)                   # keep a wide 16:9 view
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    w = min(w, W)
+    h = min(w * 9 / 16, H)
+    cx0 = int(np.clip(cx - w / 2, 0, W - w)) // 2 * 2
+    cy0 = int(np.clip(cy - h / 2, 0, H - h)) // 2 * 2
+    cw, ch = int(w) // 2 * 2, int(h) // 2 * 2
+
+    def crop(img):
+        return img[cy0:cy0 + ch, cx0:cx0 + cw]
+    # 1. what detection sees: boxes and trails on one frame
+    frame = grab_frame(str(demo.DEMO_VIDEO), t_show)
+    items = []
+    for tid, cls, box in boxes_near(det, t_show):
+        rows = det.rows_of(tid)
+        rows = rows[(det.t[rows] <= t_show) & (det.t[rows] >= t_show - 1.5)]
+        trail = [((det.box[i][0] + det.box[i][2]) / 2, det.box[i][3]) for i in rows]
+        items.append(DrawItem(tid, "person" if cls == "pedestrian" else str(cls), tuple(box), True, trail, 0.9))
+    out = {"detect": rgb(crop(render_frame(frame, items, RenderOptions(max_width=10000), 0, t_show)))}
+    # 2. calibration: the clicked rectangle on the camera view, and the road from above
+    cam = frame.copy()
+    pts = np.asarray(t["calibration_points_px"], dtype=np.int32)
+    cv2.polylines(cam, [pts], True, (0, 220, 255), 3, cv2.LINE_AA)
+    for k, (x, y) in enumerate(pts):
+        cv2.circle(cam, (int(x), int(y)), 9, (0, 220, 255), -1)
+        cv2.putText(cam, str(k + 1), (int(x) + 10, int(y) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 220, 255), 2)
+    out["cal_camera"] = rgb(crop(cam))
+    out["cal_top"] = rgb(cal.preview(frame, margin=0.25))
+    # 3. a flagged near miss and the map of all events
+    if ev:
+        out["event"] = rgb(event_frame(str(demo.DEMO_VIDEO), det, ev, "standard", True, emphasis=True, zoom=True))
+        out["event_text"] = explain_event(ev)
+    out["map"] = rgb(topdown_map(tracks, events, cal))
+    # 4. a few seconds of video with the boxes drawn, as Detect makes it, cropped the same way
+    clip = RUNS / ".method_clip_v2.mp4"
+    if not clip.exists():
+        from video_utils import ffmpeg_exe
+
+        fps = cv2.VideoCapture(str(demo.DEMO_VIDEO)).get(cv2.CAP_PROP_FPS) or 10.0
+        full = RUNS / ".method_clip_full.mp4"
+        render_from_detections(str(demo.DEMO_VIDEO), det, str(full), fps, 1, RenderOptions(max_width=10000),
+                               max(0.0, t_show - 3), t_show + 3)
+        exe = ffmpeg_exe()
+        if exe and full.exists():
+            import subprocess
+
+            subprocess.run([exe, "-y", "-loglevel", "error", "-i", str(full), "-vf",
+                            f"crop={cw}:{ch}:{cx0}:{cy0}", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                            "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-an", str(clip)], timeout=120)
+        if not clip.exists() and full.exists():
+            full.replace(clip)
+        full.unlink(missing_ok=True)
+    out["clip"] = str(clip) if clip.exists() else None
+    return out
+
+
+def sample_note() -> None:
+    st.caption(":material/movie: From the bundled sample clip: scripted road users on a drawn intersection, analysed "
+               "with the app's own code. Real footage looks busier.")
+
+
 def page_method():
     page_header("Method", "How NearMiss works",
                 "From video to a reviewed list of close calls, step by step, and what the numbers can and cannot tell "
                 "you.")
     st.markdown(figures.figure(figures.pipeline()), unsafe_allow_html=True)
+    imgs = method_images()
     tabs = st.tabs([":material/videocam: Detection", ":material/straighten: Calibration",
                     ":material/insights: Indicators", ":material/filter_alt: Filters & severity",
                     ":material/verified: Validation", ":material/shield: Privacy & limits", ":material/notes: Full text"])
@@ -3067,6 +3236,15 @@ def page_method():
         b.markdown(card("Moving camera", "If the camera drifts or zooms, every frame is lined up with the first one "
                         "(ORB features and a RANSAC homography), so parked cars stay parked.",
                         PAGE_COLORS["Event Review"]), unsafe_allow_html=True)
+        if imgs:
+            st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+            l, r = st.columns(2)
+            if imgs.get("clip"):
+                l.video(imgs["clip"], loop=True, autoplay=True, muted=True)
+                l.caption("A few seconds of tracked video: every road user boxed, with a trail of where it has been.")
+            r.image(imgs["detect"], width="stretch",
+                    caption="One frame: a box and an ID for each road user, kept the same from frame to frame.")
+            sample_note()
     with tabs[1]:
         section("Turning pixels into metres", "straighten", PAGE_COLORS["Calibrate"])
         l, r = st.columns([3, 2])
@@ -3079,6 +3257,13 @@ def page_method():
             "Checking it", "Measure one or more other known distances. Until that check is done, or when it is more than "
             "10% off, or cars measure an implausible length, every severity is shown as provisional.",
             PAGE_COLORS["Report"]), unsafe_allow_html=True)
+        if imgs:
+            l, r = st.columns(2)
+            l.image(imgs["cal_camera"], width="stretch", caption="The four clicked corners of a rectangle of known size "
+                    "on the road.")
+            r.image(imgs["cal_top"], width="stretch", caption="The same frame seen from above after calibration: the "
+                    "rectangle is square again and lane lines are parallel.")
+            sample_note()
     with tabs[2]:
         section("Measuring how close a call was", "insights", PAGE_COLORS["Results"])
         a, b = st.columns(2)
@@ -3094,6 +3279,16 @@ def page_method():
                    unsafe_allow_html=True)
         b.markdown(figures.figure(figures.drac(), "<b>DRAC</b>: the braking either road user would have needed to "
                                   "avoid the collision. Always shown; optional flag."), unsafe_allow_html=True)
+        if imgs:
+            section("A real flag from the sample clip", "flag", PAGE_COLORS["Event Review"])
+            l, r = st.columns(2)
+            if imgs.get("event") is not None:
+                l.image(imgs["event"], width="stretch", caption="The moment of closest approach: the two road users "
+                        "outlined, everything else dimmed.")
+                l.caption(imgs["event_text"])
+            r.image(imgs["map"], width="stretch", caption="Top-down map: paths (green pedestrians, purple bikes, blue "
+                    "vehicles), flagged events as dots and a heat layer.")
+            sample_note()
     with tabs[3]:
         section("Cutting false alarms, rating what is left", "filter_alt", PAGE_COLORS["Event Review"])
         c = st.columns(3)

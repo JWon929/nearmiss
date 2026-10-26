@@ -1,8 +1,19 @@
 [theme]
-# Calm navy accent; Streamlit derives the dark theme from the viewer's system setting.
+# Calm navy accent. The light and dark colours below follow the viewer's system setting (or the app menu's choice).
 primaryColor = "#1f5fbf"
 font = "sans serif"
 baseRadius = "medium"
+
+[theme.light]
+# Soft blue-grey instead of plain white, so cards and pictures stand out
+backgroundColor = "#eef2f8"
+secondaryBackgroundColor = "#dfe6f1"
+textColor = "#1e293b"
+
+[theme.dark]
+backgroundColor = "#0f172a"
+secondaryBackgroundColor = "#1e293b"
+textColor = "#e2e8f0"
 
 [server]
 maxUploadSize = 2000   # MB: intersection clips are often bigger than the 200 MB default
