@@ -62,13 +62,13 @@ CSV_HEADER = ["frame", "time_s", "track_id", "class_name", "confidence", "x1", "
 DISPLAY_W = 900
 STEPS = ["Detect", "Calibrate", "Results", "Event Review", "Report"]
 LEARN = ["Purpose", "Method", "Proposed designs", "Help & contact"]
-PAGES = STEPS + LEARN
-PAGE_ICONS = {"Detect": ":material/videocam:", "Calibrate": ":material/straighten:", "Results": ":material/analytics:",
+PAGES = ["Home"] + STEPS + LEARN
+PAGE_ICONS = {"Home": ":material/home:", "Detect": ":material/videocam:", "Calibrate": ":material/straighten:", "Results": ":material/analytics:",
               "Event Review": ":material/fact_check:", "Report": ":material/description:",
               "Purpose": ":material/flag:", "Proposed designs": ":material/architecture:",
               "Method": ":material/menu_book:", "Help & contact": ":material/support_agent:"}
 # One accent colour per page: its banner, its sidebar button and its buttons use it, so each step is easy to tell apart.
-PAGE_COLORS = {"Detect": "#2563eb", "Calibrate": "#7c3aed", "Results": "#0d9488", "Event Review": "#ea580c",
+PAGE_COLORS = {"Home": "#0f766e", "Detect": "#2563eb", "Calibrate": "#7c3aed", "Results": "#0d9488", "Event Review": "#ea580c",
                "Report": "#16a34a", "Purpose": "#db2777", "Method": "#4f46e5", "Proposed designs": "#0891b2",
                "Help & contact": "#64748b"}
 INQUIRIES = Path(__file__).parent / "inquiries"          # questions and feedback typed into the app (git-ignored)
@@ -128,6 +128,15 @@ section[data-testid="stSidebar"] div[class*="st-key-nav_"] {margin-bottom: -8px;
 section[data-testid="stSidebar"] div[class*="st-key-nav_"] button {box-shadow: none !important; min-height: 2.1rem;}
 section[data-testid="stSidebar"] div[class*="st-key-nav_"] button p {font-weight: 600;}
 .nm-pager-gap {height: 18px;}
+/* ---- home ---- */
+.nm-act {min-height: 92px; line-height: 1.35;}
+.nm-act .i {float: left; width: 40px; height: 40px; border-radius: 11px; margin: 2px 12px 6px 0; color: #fff;
+  display: flex; align-items: center; justify-content: center; font-family: "Material Symbols Rounded"; font-size: 23px;}
+.nm-act b {font-size: 1.05rem;}
+.nm-dots {display: flex; gap: 4px; margin: 8px 0 4px 0;}
+.nm-dots span {flex: 1; height: 6px; border-radius: 3px;}
+.nm-rec b {display: block; font-size: 1rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;}
+.nm-rec small {opacity: .7;}
 .st-key-pager {background: rgba(128,128,128,.04);}
 /* ---- method and purpose pages ---- */
 .nm-card {border-radius: 14px; padding: 14px 16px; height: 100%; border: 1px solid rgba(128,128,128,.2);}
@@ -181,7 +190,8 @@ def page_header(page: str, title: str, intro: str = "") -> None:
     icon = PAGE_ICONS.get(page, ":material/info:").split("/")[-1].strip(":")
     c = PAGE_COLORS.get(page, "#2563eb")
     rgb_ = hex_rgb(c)
-    pill = f"Procedure · step {STEPS.index(page) + 1} of {len(STEPS)}" if page in STEPS else "Learn & help"
+    pill = f"Procedure · step {STEPS.index(page) + 1} of {len(STEPS)}" if page in STEPS else \
+        ("Home" if page == "Home" else "Learn & help")
     bars = ""
     if page in STEPS:
         done = steps_done(st.session_state.get("rid")) if st.session_state.get("rid") else {}
@@ -612,24 +622,29 @@ with st.sidebar:
         st.session_state["rec_pick"] = st.session_state["rid"]
         st.selectbox("Recording", ids, key="rec_pick", format_func=lambda i: dict(runs)[i], on_change=pick_recording)
     if st.session_state.get("page") not in PAGES:
-        st.session_state["page"] = "Detect" if all_runs else "Purpose"
+        st.session_state["page"] = "Home"
     page = st.session_state["page"]
     done = steps_done(st.session_state["rid"]) if st.session_state.get("rid") else {}
     nav_css = "".join(
         f".st-key-nav_{i} button {{border-left: 4px solid {PAGE_COLORS[p]} !important; justify-content: flex-start;}}"
         f".st-key-nav_{i} button[kind='primary'] {{background: {PAGE_COLORS[p]} !important; border-color: "
         f"{PAGE_COLORS[p]} !important; color: #fff !important;}}" for i, p in enumerate(PAGES))
-    st.markdown(f"<style>{nav_css}</style><div class='nm-navhead'>Procedure</div>", unsafe_allow_html=True)
+    st.markdown(f"<style>{nav_css}</style>", unsafe_allow_html=True)
+
+    def nav(p: str, label: str) -> None:
+        st.button(label, key=f"nav_{PAGES.index(p)}", icon=PAGE_ICONS[p], on_click=go, args=(p,), width="stretch",
+                  type="primary" if p == page else "secondary")
+
+    nav("Home", "Home")
+    st.markdown("<div class='nm-navhead'>Procedure</div>", unsafe_allow_html=True)
     for i, p in enumerate(STEPS):
-        st.button(f"{i + 1}. {p}" + ("  ✓" if done.get(p) else ""), key=f"nav_{i}", icon=PAGE_ICONS[p],
-                  type="primary" if p == page else "secondary", on_click=go, args=(p,), width="stretch")
+        nav(p, f"{i + 1}. {p}" + ("  ✓" if done.get(p) else ""))
     if st.session_state.get("rid"):
         n_done = sum(bool(done.get(p)) for p in STEPS)
         st.progress(n_done / len(STEPS), text=f"{n_done} of {len(STEPS)} steps done for this recording")
     st.markdown("<div class='nm-navhead'>Learn & help</div>", unsafe_allow_html=True)
-    for i, p in enumerate(LEARN, start=len(STEPS)):
-        st.button(p, key=f"nav_{i}", icon=PAGE_ICONS[p], type="primary" if p == page else "secondary", on_click=go,
-                  args=(p,), width="stretch")
+    for p in LEARN:
+        nav(p, p)
     st.divider()
     if demo.demo_available() and st.button("Load synthetic demo"):
         st.session_state["rid"] = create_demo_run()
@@ -2854,6 +2869,119 @@ def card(title: str, text: str, color: str) -> str:
             f"<h4 style='color:{color}'>{title}</h4><p>{text}</p></div>")
 
 
+def quick_progress(r: str) -> dict:
+    """Which steps a recording has done, from its files only (no analysis), so Home stays fast with many recordings."""
+    d = run_dir(r)
+    labels = read_json(d / "labels.json", {}) or {}
+    cal = (d / "calibration.json").exists()
+    return {"Detect": (d / "detections.csv").exists(), "Calibrate": cal, "Results": cal,
+            "Event Review": bool(labels.get("events")), "Report": report_state(r)[0] != "none"}
+
+
+def next_step(prog: dict) -> str:
+    return next((p for p in STEPS if not prog.get(p)), "Report")
+
+
+def open_recording(r: str, page: str) -> None:
+    """Button callback: select a recording and go to a page."""
+    st.session_state["rid"] = r
+    st.session_state["page"] = page
+
+
+def step_dots(prog: dict) -> str:
+    return "<div class='nm-dots'>" + "".join(
+        f"<span title='{p}' style='background:{PAGE_COLORS[p] if prog.get(p) else 'rgba(128,128,128,.25)'}'></span>"
+        for p in STEPS) + "</div>"
+
+
+def page_home():
+    page_header("Home", "Welcome to NearMiss",
+                "Film an intersection, and NearMiss finds every moment two road users came dangerously close, for you "
+                "to check and report. Everything runs on this computer.")
+    runs = list_runs()
+    metas = {r: read_json(run_dir(r) / "meta.json", {}) or {} for r, _ in runs}
+    last = st.session_state.get("rid") if st.session_state.get("rid") in metas else (runs[0][0] if runs else None)
+
+    # ---- what to do now
+    a, b, c = st.columns(3)
+    with a.container(border=True, key="home_new"):
+        st.markdown(f"<div class='nm-act'><span class='i' style='background:{PAGE_COLORS['Detect']}'>add_a_photo</span>"
+                    "<b>New recording</b><br><small>Upload one or more intersection clips.</small></div>",
+                    unsafe_allow_html=True)
+        st.button("Start: Detect", type="primary", icon=":material/arrow_forward:", on_click=go, args=("Detect",),
+                  width="stretch", key="home_go_detect")
+    with b.container(border=True, key="home_continue"):
+        if last:
+            prog = quick_progress(last)
+            nxt = next_step(prog)
+            st.markdown(f"<div class='nm-act'><span class='i' style='background:{PAGE_COLORS[nxt]}'>play_arrow</span>"
+                        f"<b>Continue</b><br><small>{html_escape(display_name(metas[last], run_dir(last)))}: next is "
+                        f"<b style='color:{PAGE_COLORS[nxt]}'>{STEPS.index(nxt) + 1}. {nxt}</b></small></div>"
+                        + step_dots(prog), unsafe_allow_html=True)
+            st.button(f"Open {nxt}", icon=":material/arrow_forward:", on_click=open_recording, args=(last, nxt),
+                      width="stretch", key="home_continue_btn")
+        else:
+            st.markdown(f"<div class='nm-act'><span class='i' style='background:{PAGE_COLORS['Results']}'>play_arrow"
+                        "</span><b>Continue</b><br><small>No recordings yet. Your work will show up here.</small></div>",
+                        unsafe_allow_html=True)
+    with c.container(border=True, key="home_demo"):
+        st.markdown(f"<div class='nm-act'><span class='i' style='background:{PAGE_COLORS['Purpose']}'>science</span>"
+                    "<b>Try the demo</b><br><small>A scripted intersection with two near misses, to see every page."
+                    "</small></div>", unsafe_allow_html=True)
+        if demo.demo_available():
+            st.button("Open the demo", icon=":material/science:", width="stretch", key="home_demo_btn",
+                      on_click=lambda: st.session_state.update(rid=create_demo_run(), page="Results"))
+
+    # ---- unfinished detections
+    jobs = [(p.name, load_job(p)) for p in sorted(RUNS.iterdir()) if p.is_dir() and not (p / "meta.json").exists()]
+    jobs = [(r, j) for r, j in jobs if j]
+    if jobs:
+        st.warning(f"**{len(jobs)} detection(s) stopped part-way**: "
+                   + ", ".join(f"{j['name']} ({j['next_frame'] / max(j['meta']['frame_count'], 1):.0%})"
+                               for _, j in jobs) + ". The finished parts were kept.", icon=":material/pause_circle:")
+        st.button("Resume on Detect", icon=":material/play_arrow:", on_click=go, args=("Detect",), key="home_resume")
+
+    # ---- your work so far
+    real = [r for r in metas if not metas[r].get("synthetic")]
+    hours = sum(metas[r].get("duration_s", 0) for r in real) / 3600
+    labelled = sum(len((read_json(run_dir(r) / "labels.json", {}) or {}).get("events", [])) for r in real)
+    section("Your work so far", "insights", PAGE_COLORS["Home"])
+    kpis([("Recordings", len(real)), ("Footage analysed", f"{hours:.1f} h" if hours >= 1 else f"{hours * 60:.0f} min"),
+          ("Road-user detections", f"{sum(metas[r].get('detection_rows', 0) for r in real):,}"),
+          ("Flags you reviewed", labelled), ("Reports made", sum(report_state(r)[0] != "none" for r in real))])
+
+    # ---- recent recordings
+    if runs:
+        section("Recent recordings", "video_library", PAGE_COLORS["Detect"])
+        cols = st.columns(3)
+        for k, (r, _) in enumerate(runs[:6]):
+            m = metas[r]
+            prog = quick_progress(r)
+            nxt = next_step(prog)
+            view = "demo" if m.get("synthetic") else {"overhead": "drone", "angled": "street-level"}.get(m.get("view"), "")
+            when = time.strftime("%b %d, %H:%M", time.localtime(m.get("created", 0)))
+            with cols[k % 3].container(border=True, key=f"home_rec_{k}"):
+                st.markdown(f"<div class='nm-rec'><b>{html_escape(display_name(m, run_dir(r)))}</b>"
+                            f"<small>{when} · {view} · {m.get('duration_s', 0) / 60:.1f} min</small></div>"
+                            + step_dots(prog)
+                            + f"<small style='opacity:.75'>{sum(prog.values())} of {len(STEPS)} steps · next: "
+                              f"<b style='color:{PAGE_COLORS[nxt]}'>{nxt}</b></small>", unsafe_allow_html=True)
+                st.button(f"Continue: {nxt}", key=f"home_open_{r}", on_click=open_recording, args=(r, nxt),
+                          width="stretch", icon=":material/arrow_forward:")
+        if len(runs) > 6:
+            st.caption(f"{len(runs) - 6} older recording(s): pick them in the sidebar.")
+
+    # ---- learn
+    section("Learn", "school", PAGE_COLORS["Method"])
+    cols = st.columns(3)
+    for col, (p, text) in zip(cols, [("Purpose", "Why close calls tell you about danger long before crashes do."),
+                                     ("Method", "How detection, calibration and the indicators work, with diagrams."),
+                                     ("Help & contact", "Answers to common questions, and a way to ask the team.")]):
+        with col.container(border=True, key=f"home_learn_{PAGES.index(p)}"):
+            st.markdown(card(p, text, PAGE_COLORS[p]), unsafe_allow_html=True)
+            st.button(f"Open {p}", key=f"home_learn_btn_{PAGES.index(p)}", on_click=go, args=(p,), width="stretch")
+
+
 def page_purpose():
     page_header("Purpose", "Why NearMiss exists",
                 "Crashes are what we want to prevent, but they are too rare at one intersection to learn from quickly. "
@@ -3289,7 +3417,7 @@ def preferences_ui() -> None:
 
 {"Detect": page_detect, "Calibrate": page_calibrate, "Results": page_results, "Event Review": page_review,
  "Report": page_report, "Proposed designs": page_design, "Method": page_method, "Help & contact": page_help,
- "Purpose": page_purpose}[page]()
+ "Purpose": page_purpose, "Home": page_home}[page]()
 step_pager(page)
 st.markdown("<div class='nm-footer'>NearMiss · a screening tool for traffic conflicts, not a crash predictor or a "
             "safety certification · everything runs on this computer</div>", unsafe_allow_html=True)
