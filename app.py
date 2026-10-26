@@ -160,6 +160,12 @@ section[data-testid="stSidebar"] div[class*="st-key-nav_"] button p {font-weight
 .st-key-pager {background: rgba(128,128,128,.04);}
 /* ---- method and purpose pages ---- */
 .nm-card {border-radius: 14px; padding: 14px 16px; height: 100%; border: 1px solid rgba(128,128,128,.2);}
+.nm-story {position: relative; border-radius: 14px; padding: 22px 26px 10px 64px;}
+.nm-story .q {position: absolute; left: 18px; top: 2px; font-size: 4.2rem; font-weight: 800; line-height: 1;
+  font-family: Georgia, serif;}
+.nm-story blockquote {margin: 0 0 12px 0; padding: 0; border: none; font-size: 1.3rem; font-weight: 600;
+  font-style: italic; line-height: 1.45; color: inherit !important; opacity: 1 !important;}
+.nm-story p {font-size: 1.02rem; line-height: 1.6; opacity: .88;}
 .nm-card h4 {margin: 0 0 4px 0; font-size: 1.02rem;}
 .nm-card p {margin: 0; font-size: .92rem; opacity: .9;}
 div[data-testid="stVerticalBlockBorderWrapper"] {background: rgba(255,255,255,.55);}
@@ -3064,6 +3070,19 @@ def page_purpose():
     page_header("Purpose", "Why NearMiss exists",
                 "Crashes are what we want to prevent, but they are too rare at one intersection to learn from quickly. "
                 "Close calls are not.")
+    c_, rgb_ = PAGE_COLORS["Purpose"], hex_rgb(PAGE_COLORS["Purpose"])
+    section("Why we built it", "campaign", c_)
+    st.markdown(f"""<div class='nm-story' style='background: rgba({rgb_},.07); border-left: 5px solid {c_}'>
+<div class='q' style='color:{c_}'>&ldquo;</div>
+<blockquote>Crashes near our school have affected students we know, and we kept asking why we only look at an
+intersection after someone gets hurt.</blockquote>
+<p>For students living in Mountain House, traffic violations are obvious to anyone crossing on foot. Students talk about
+nearly getting hit by the third Tesla in a week on their way to school, or watching cars run red lights on Mountain
+House Parkway. Even with the wave of new traffic rules in January 2026, it still isn't enough to get people to follow
+the law. Hearing those complaints, and having near misses of our own, is what led us to build NearMiss.</p>
+</div>""", unsafe_allow_html=True)
+
+    section("The idea in short", "lightbulb", PAGE_COLORS["Method"])
     a, b, c = st.columns(3)
     a.markdown(card("The problem", "At any single intersection serious crashes are rare, so crash records take years "
                     "to show a pattern, and by then people have been hurt.", PAGE_COLORS["Purpose"]),
