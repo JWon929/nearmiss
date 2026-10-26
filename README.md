@@ -71,4 +71,6 @@ Detection uses pretrained models I did not train:
   `tools/train_visdrone_colab.ipynb` on Google Colab.
 - **Tracking:** ByteTrack.
 
-Write down which parts you wrote yourself and where AI helped; the Report page has a template.
+##AI Usage
+-Models utilized AI for detection
+-Helped with the aesthetics and UI of the website/app
