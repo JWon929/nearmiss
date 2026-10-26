@@ -11,7 +11,8 @@ Windows: `.\setup.ps1`. Mac or Linux: `./setup.sh`. Or by hand:
 pip install -r requirements.txt
 streamlit run app.py
 ```
-Click **Load synthetic demo** in the sidebar to try every page without footage. See `ARCHITECTURE.md` for how it is
+Click **Try the demo** on Home (or *Manage recordings > Load synthetic demo* in the sidebar) to try every page
+without footage. See `ARCHITECTURE.md` for how it is
 built, `CONTRIBUTING.md` before changing it, and `DATA.md` for the data statement to fill in.
 
 ## Speed

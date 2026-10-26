@@ -616,38 +616,39 @@ def trash_recording(rid_: str) -> None:
 
 
 def recording_options_ui(rid_: str, m: dict) -> None:
-    with st.expander("This recording", icon=":material/settings:"):
-        new = st.text_input("Name", display_name(m, run_dir(rid_)), key=f"rename_{rid_}")
-        if new.strip() and new.strip() != display_name(m, run_dir(rid_)) and st.button("Rename"):
-            m["display_name"] = new.strip()
-            write_json(run_dir(rid_) / "meta.json", m)
-            st.rerun()
-        st.caption("Delete moves it to *Recently deleted*, where it can be restored.")
-        if st.button("Delete this recording", icon=":material/delete:"):
-            trash_recording(rid_)
-            st.rerun()
+    st.markdown("**This recording**")
+    new = st.text_input("Name", display_name(m, run_dir(rid_)), key=f"rename_{rid_}")
+    if new.strip() and new.strip() != display_name(m, run_dir(rid_)) and st.button("Rename"):
+        m["display_name"] = new.strip()
+        write_json(run_dir(rid_) / "meta.json", m)
+        st.rerun()
+    if st.button("Delete this recording", icon=":material/delete:",
+                 help="Moves it to Recently deleted, where it can be restored."):
+        trash_recording(rid_)
+        st.rerun()
 
 
-def trash_ui() -> None:
+def trash_items() -> list:
     if not TRASH.exists():
-        return
-    items = sorted([p for p in TRASH.iterdir() if p.is_dir()], key=lambda p: -mtime(p / "deleted.json"))
-    if not items:
-        return
-    with st.expander(f"Recently deleted ({len(items)})", icon=":material/restore_from_trash:"):
-        for p in items:
-            m = read_json(p / "meta.json", {}) or {}
-            l, r = st.columns([3, 2])
-            l.caption(display_name(m, p))
-            if r.button("Restore", key=f"restore_{p.name}"):
-                if not run_dir(p.name).exists():
-                    shutil.move(str(p), str(run_dir(p.name)))
-                    (run_dir(p.name) / "deleted.json").unlink(missing_ok=True)
-                    st.session_state["rid"] = p.name
-                st.rerun()
-        if st.button("Empty it (cannot be undone)", type="primary"):
-            shutil.rmtree(TRASH, ignore_errors=True)
+        return []
+    return sorted([p for p in TRASH.iterdir() if p.is_dir()], key=lambda p: -mtime(p / "deleted.json"))
+
+
+def trash_ui(items: list) -> None:
+    st.markdown(f"**Recently deleted ({len(items)})**")
+    for p in items:
+        m = read_json(p / "meta.json", {}) or {}
+        l, r = st.columns([3, 2])
+        l.caption(display_name(m, p))
+        if r.button("Restore", key=f"restore_{p.name}"):
+            if not run_dir(p.name).exists():
+                shutil.move(str(p), str(run_dir(p.name)))
+                (run_dir(p.name) / "deleted.json").unlink(missing_ok=True)
+                st.session_state["rid"] = p.name
             st.rerun()
+    if st.button("Empty it (cannot be undone)", type="primary"):
+        shutil.rmtree(TRASH, ignore_errors=True)
+        st.rerun()
 
 
 def clean_interrupted() -> int:
@@ -665,13 +666,12 @@ def clean_interrupted() -> int:
 with st.sidebar:
     st.markdown("<div class='nm-brand'><div class='logo'>traffic</div><div><div class='name'>NearMiss</div>"
                 "<div class='tag'>Traffic conflict screening</div></div></div>", unsafe_allow_html=True)
-    st.caption("Finds where road users came close. Not a crash predictor.")
     if "_cleaned" not in st.session_state:
         st.session_state["_cleaned"] = clean_interrupted()
     all_runs = list_runs()
     if all_runs:
         search = st.text_input("Find a recording", placeholder="name, date, drone...", label_visibility="collapsed",
-                               key="run_search")
+                               key="run_search") if len(all_runs) > 5 else ""   # a search box only once there are many
         runs = list_runs(search) or all_runs
         ids = [r[0] for r in runs]
         if search and not list_runs(search):
@@ -698,22 +698,23 @@ with st.sidebar:
     st.markdown("<div class='nm-navhead'>Procedure</div>", unsafe_allow_html=True)
     for i, p in enumerate(STEPS):
         nav(p, f"{i + 1}. {p}" + ("  ✓" if done.get(p) else ""))
-    if st.session_state.get("rid"):
-        n_done = sum(bool(done.get(p)) for p in STEPS)
-        st.progress(n_done / len(STEPS), text=f"{n_done} of {len(STEPS)} steps done for this recording")
     st.markdown("<div class='nm-navhead'>Learn & help</div>", unsafe_allow_html=True)
     for p in LEARN:
         nav(p, p)
     st.divider()
-    if demo.demo_available() and st.button("Load synthetic demo"):
-        st.session_state["rid"] = create_demo_run()
-        st.rerun()
-    if st.session_state.get("rid") and (run_dir(st.session_state["rid"]) / "meta.json").exists():
-        recording_options_ui(st.session_state["rid"], read_json(run_dir(st.session_state["rid"]) / "meta.json", {}))
-    trash_ui()
+    # everything that is not navigation sits in one closed panel
+    trashed = trash_items()
+    with st.expander("Manage recordings", icon=":material/folder_managed:"):
+        if demo.demo_available() and st.button("Load synthetic demo", icon=":material/science:"):
+            st.session_state["rid"] = create_demo_run()
+            st.rerun()
+        if st.session_state.get("rid") and (run_dir(st.session_state["rid"]) / "meta.json").exists():
+            recording_options_ui(st.session_state["rid"], read_json(run_dir(st.session_state["rid"]) / "meta.json", {}))
+        if trashed:
+            trash_ui(trashed)
     if st.session_state.get("_cleaned"):
         st.caption(f"Removed {st.session_state['_cleaned']} unfinished run folder(s) left by a stopped detection.")
-    st.caption(":material/lock: All processing happens on this computer. Footage is not uploaded anywhere.")
+    st.caption(":material/lock: Runs on this computer. Nothing is uploaded.")
     scroll_helper(st.session_state.get("_shown_page") != page, page)
     st.session_state["_shown_page"] = page
 
@@ -742,7 +743,9 @@ def settings_chips(rid_: str, m: dict) -> None:
         "scripted" if m.get("synthetic") else "?")
     status = cal_status(rid_, m)
     p = privacy_of(m)
-    chips([("Model", model, None),
+    chips([("Recording", display_name(m, run_dir(rid_)), None)]
+          + ([("Data", "synthetic demo", "#db2777")] if m.get("synthetic") else []) + [
+          ("Model", model, None),
            ("Camera", {"center": "straight down", "bottom": "angled"}[S.ground_point], None),
            ("Calibration", status["title"], LEVEL_HEX[status["level"]]),
            ("Peds & bikes", "not measured" if blind_spot(m) else "measured", "#c62828" if blind_spot(m) else None),
@@ -757,6 +760,9 @@ def settings_chips(rid_: str, m: dict) -> None:
             inp = cd.get("input", {})
             cal = (f"{inp['distance_m']} m line" if inp.get("method") == "line"
                    else f"{cd['width_m']:g} x {cd['length_m']:g} m rectangle")
+        if m.get("synthetic"):
+            st.caption("Synthetic demo: scripted road users on a drawn road. It checks the maths on a known answer. "
+                       "It says nothing about accuracy on real traffic.")
         st.markdown(f"- Calibration: {cal}. {status['detail']}\n"
                     f"- TTC thresholds (candidate / moderate / serious): {S.ttc_candidate_s:g} / {S.ttc_moderate_s:g}"
                     f" / {S.ttc_serious_s:g} s\n"
@@ -771,15 +777,11 @@ def settings_chips(rid_: str, m: dict) -> None:
 def need_run() -> bool:
     damaged_files_ui()
     if rid is None:
-        st.info("Start on the **Detect** page: upload a clip. Or click *Load synthetic demo* in the sidebar to try the "
-                "whole app without footage.")
+        st.info("Start on the **Detect** page: upload a clip. Or click *Try the demo* on Home to try the whole app "
+                "without footage.")
         return True
-    st.caption(f"Recording: **{display_name(meta, run_dir(rid))}**  (change it in the sidebar)")
     settings_chips(rid, meta)
-    if meta.get("synthetic"):
-        st.info("Synthetic demo: scripted road users on a drawn road. It checks the maths on a known answer. It says "
-                "nothing about accuracy on real traffic.", icon=":material/science:")
-    else:
+    if not meta.get("synthetic"):
         frames = meta.get("frame_count", 0) / max(1, meta.get("stride", 1))
         per_frame = meta.get("detection_rows", 0) / frames if frames and "detection_rows" in meta else None
         if per_frame is not None and per_frame < 2:
@@ -863,8 +865,8 @@ def page_detect():
     prewarm_detector()
     if load_prefs().get("tips", True) and not list_runs():
         st.info("**New here?** 1) Upload an intersection clip below and press Run. 2) Calibrate with a rectangle you "
-                "know the size of. 3) Look at Results, then review each flag. Or try *Load synthetic demo* in the "
-                "sidebar first. Tips can be turned off under Help & contact > Preferences.", icon=":material/lightbulb:")
+                "know the size of. 3) Look at Results, then review each flag. Or click *Try the demo* on Home "
+                "first. Tips can be turned off under Help & contact > Preferences.", icon=":material/lightbulb:")
     unfinished_ui()
     ups = st.file_uploader("Intersection video(s)", type=["mp4", "mov", "m4v"], accept_multiple_files=True,
                            help="Choose several clips to process them one after another, each as its own recording.")
@@ -873,29 +875,7 @@ def page_detect():
                                            "overhead": "From above (drone looking straight down)"}[v])
     overhead = view == "overhead"
     choices = aerial_choices() if overhead else MODEL_CHOICES
-    c1, c2, c3 = st.columns(3)
-    model = c1.selectbox("Model", list(choices), key=f"model_{view}", format_func=lambda m: f"{m}  ({choices[m]})")
-    if overhead and not finds_people(model):
-        msg = ("This model finds cars, buses and trucks seen from above, but **not pedestrians or bicycles**: their "
-               "conflicts will show as *not measured*.")
-        msg += (f" Choose **{VISDRONE_MODEL}** to include them." if VISDRONE_MODEL in choices else
-                f" To find them too, train the VisDrone model (tools/train_visdrone_colab.ipynb) and put "
-                f"`{VISDRONE_MODEL}` in the app folder.")
-        st.warning(msg)
-    elif model == VISDRONE_MODEL:
-        st.info("Also finds pedestrians, bikes and motorcycles from above. It mistakes some street furniture (lamp "
-                "posts, signal boxes) for people, so a pedestrian or bike that never moves is hidden in the video and "
-                "left out of the analysis; you can restore any real one on Results. Use *Try on the first 10 s*.")
-    imgsz = c2.select_slider("Detection size (px)", [640, 800, 960, 1280], value=960,
-                             help="Bigger finds smaller or farther road users but is slower. "
-                                  "For overhead models 960 works best: bigger sizes start calling cars 'large vehicles'.")
-    devices = ["auto", "cpu"] + [f"intel:{d.lower()}" for d in ("GPU", "NPU") if d in intel_devices()] + ["mps", "cuda:0"]
     prefs = load_prefs()
-    device = c3.selectbox("Device", devices, index=devices.index(prefs["device"]) if prefs.get("device") in devices else 0,
-                          format_func=lambda d: f"auto ({device_label(pick_device('auto'))})"
-                          if d == "auto" else device_label(d),
-                          help="auto picks the fastest one found: an NVIDIA GPU, an Apple chip, or an Intel GPU "
-                               "(through OpenVINO, about 4x faster than the CPU on an Intel Arc laptop chip).")
     speed = st.radio("Speed", list(SPEED_MODES), horizontal=True, key="det_speed",
                      index=list(SPEED_MODES).index(prefs["speed"]) if prefs.get("speed") in SPEED_MODES else 1,
                      format_func=lambda k: SPEED_MODES[k]["label"],
@@ -904,7 +884,20 @@ def page_detect():
                           "they are drawn when you open them.")
     st.caption(SPEED_MODES[speed]["note"])
     analysis_fps, draw_video = SPEED_MODES[speed]["fps"], SPEED_MODES[speed]["video"]
-    with st.expander("More settings"):
+    with st.expander("Model and more settings", icon=":material/tune:"):
+        c1, c2, c3 = st.columns(3)
+        model = c1.selectbox("Model", list(choices), key=f"model_{view}", format_func=lambda m: f"{m}  ({choices[m]})")
+        imgsz = c2.select_slider("Detection size (px)", [640, 800, 960, 1280], value=960,
+                                 help="Bigger finds smaller or farther road users but is slower. For overhead models "
+                                      "960 works best: bigger sizes start calling cars 'large vehicles'.")
+        devices = ["auto", "cpu"] + [f"intel:{d.lower()}" for d in ("GPU", "NPU") if d in intel_devices()] \
+            + ["mps", "cuda:0"]
+        device = c3.selectbox("Device", devices,
+                              index=devices.index(prefs["device"]) if prefs.get("device") in devices else 0,
+                              format_func=lambda d: f"auto ({device_label(pick_device('auto'))})"
+                              if d == "auto" else device_label(d),
+                              help="auto picks the fastest one found: an NVIDIA GPU, an Apple chip, or an Intel GPU "
+                                   "(through OpenVINO, about 4x faster than the CPU on an Intel Arc laptop chip).")
         a, b, c = st.columns(3)
         high = a.slider("Detection confidence", 0.10, 0.60, 0.25, 0.05,
                         help="Lower finds more, but adds false boxes. Weak detections only extend existing tracks.")
@@ -929,6 +922,19 @@ def page_detect():
         conf_show = st.checkbox("Show confidence on labels", False)
         if not blur:
             st.warning("Blur is off: the videos this run makes will show faces and plates. Do not share them.")
+    # warnings about the chosen model stay outside the closed panel
+    if overhead and not finds_people(model):
+        msg = ("This model finds cars, buses and trucks seen from above, but **not pedestrians or bicycles**: their "
+               "conflicts will show as *not measured*.")
+        msg += (f" Choose **{VISDRONE_MODEL}** under *Model and more settings* to include them."
+                if VISDRONE_MODEL in choices else
+                f" To find them too, train the VisDrone model (tools/train_visdrone_colab.ipynb) and put "
+                f"`{VISDRONE_MODEL}` in the app folder.")
+        st.warning(msg)
+    elif model == VISDRONE_MODEL:
+        st.info("Also finds pedestrians, bikes and motorcycles from above. It mistakes some street furniture (lamp "
+                "posts, signal boxes) for people, so a pedestrian or bike that never moves is hidden in the video and "
+                "left out of the analysis; you can restore any real one on Results. Use *Try on the first 10 s*.")
 
     if not ups:
         return
@@ -2148,8 +2154,9 @@ def page_results():
     summ = validation.summarize(events, store)
     sev = pd.Series([e["severity"] for e in events]).value_counts() if events else pd.Series(dtype=int)
     prov = "*" if events and events[0].get("provisional") else ""
-    kpis([("Flagged events", len(events)), (f"Serious{prov}", int(sev.get("serious", 0))),
-          (f"Moderate{prov}", int(sev.get("moderate", 0))), (f"Candidate{prov}", int(sev.get("candidate", 0))),
+    kpis([("Flagged events", len(events)),
+          (f"Serious / moderate / candidate{prov}",
+           f"{int(sev.get('serious', 0))} / {int(sev.get('moderate', 0))} / {int(sev.get('candidate', 0))}"),
           ("Confirmed real", f"{summ['tp']} of {summ['reviewed'] + summ['unsure']} reviewed" if summ["reviewed"] + summ["unsure"]
            else "not reviewed"),
           ("Road users", stats["analysed_tracks"]), ("Flagged per hour", rate(stats["events_per_hour"]))])
@@ -3020,20 +3027,18 @@ def page_home():
                                for _, j in jobs) + ". The finished parts were kept.", icon=":material/pause_circle:")
         st.button("Resume on Detect", icon=":material/play_arrow:", on_click=go, args=("Detect",), key="home_resume")
 
-    # ---- your work so far
-    real = [r for r in metas if not metas[r].get("synthetic")]
-    hours = sum(metas[r].get("duration_s", 0) for r in real) / 3600
-    labelled = sum(len((read_json(run_dir(r) / "labels.json", {}) or {}).get("events", [])) for r in real)
-    section("Your work so far", "insights", PAGE_COLORS["Home"])
-    kpis([("Recordings", len(real)), ("Footage analysed", f"{hours:.1f} h" if hours >= 1 else f"{hours * 60:.0f} min"),
-          ("Road-user detections", f"{sum(metas[r].get('detection_rows', 0) for r in real):,}"),
-          ("Flags you reviewed", labelled), ("Reports made", sum(report_state(r)[0] != "none" for r in real))])
-
-    # ---- recent recordings
+    # ---- recent recordings, with a one-line total instead of a row of number cards
     if runs:
         section("Recent recordings", "video_library", PAGE_COLORS["Detect"])
+        real = [r for r in metas if not metas[r].get("synthetic")]
+        if real:
+            hours = sum(metas[r].get("duration_s", 0) for r in real) / 3600
+            labelled = sum(len((read_json(run_dir(r) / "labels.json", {}) or {}).get("events", [])) for r in real)
+            st.caption(f"{len(real)} recording(s) · {f'{hours:.1f} h' if hours >= 1 else f'{hours * 60:.0f} min'} "
+                       f"analysed · {labelled} flag(s) reviewed · "
+                       f"{sum(report_state(r)[0] != 'none' for r in real)} report(s) made")
         cols = st.columns(3)
-        for k, (r, _) in enumerate(runs[:6]):
+        for k, (r, _) in enumerate(runs[:3]):
             m = metas[r]
             prog = quick_progress(r)
             nxt = next_step(prog)
@@ -3047,18 +3052,8 @@ def page_home():
                               f"<b style='color:{PAGE_COLORS[nxt]}'>{nxt}</b></small>", unsafe_allow_html=True)
                 st.button(f"Continue: {nxt}", key=f"home_open_{r}", on_click=open_recording, args=(r, nxt),
                           width="stretch", icon=":material/arrow_forward:")
-        if len(runs) > 6:
-            st.caption(f"{len(runs) - 6} older recording(s): pick them in the sidebar.")
-
-    # ---- learn
-    section("Learn", "school", PAGE_COLORS["Method"])
-    cols = st.columns(3)
-    for col, (p, text) in zip(cols, [("Purpose", "Why close calls tell you about danger long before crashes do."),
-                                     ("Method", "How detection, calibration and the indicators work, with diagrams."),
-                                     ("Help & contact", "Answers to common questions, and a way to ask the team.")]):
-        with col.container(border=True, key=f"home_learn_{PAGES.index(p)}"):
-            st.markdown(card(p, text, PAGE_COLORS[p]), unsafe_allow_html=True)
-            st.button(f"Open {p}", key=f"home_learn_btn_{PAGES.index(p)}", on_click=go, args=(p,), width="stretch")
+        if len(runs) > 3:
+            st.caption(f"{len(runs) - 3} older recording(s): pick them in the sidebar.")
 
 
 def page_purpose():
@@ -3486,7 +3481,7 @@ def page_help():
                             f"{icon}</div><b>{name}</b>", unsafe_allow_html=True)
                 st.caption(text)
                 st.button("Open", key=f"qs_{name}", on_click=go, args=(name,), width="stretch")
-        st.caption("No footage yet? Click *Load synthetic demo* in the sidebar to try every page with a scripted scene.")
+        st.caption("No footage yet? *Try the demo* on Home opens every page with a scripted scene.")
     with tabs[1]:
         search = st.text_input("Search the questions", placeholder="e.g. battery, drone, provisional", key="faq_q")
         shown = [(q, a) for q, a in FAQ if not search or search.lower() in (q + a).lower()]
